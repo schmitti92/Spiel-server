@@ -219,7 +219,7 @@ const boardPath = path.join(process.cwd(), "board.json");
 const BOARD = JSON.parse(fs.readFileSync(boardPath, "utf-8"));
 const NODES = new Map((BOARD.nodes || []).map(n => [n.id, n]));
 const EDGES = BOARD.edges || [];
-const DEFAULT_BARRICADES = (BOARD.nodes || []).filter(n => n.kind === "barricade").map(n => n.id);
+const DEFAULT_BARRICADES = (BOARD.nodes || []).filter(n => n.kind === "board" && n.flags && n.flags.run === true).map(n => n.id);
 const ADJ = new Map();
 
 for (const [a, b] of EDGES) {
@@ -407,12 +407,13 @@ function initGameState(room) {
     }
   }
 
-  // barricades: from board
-  const barricades = (BOARD.nodes || [])
-    .filter(n => n.kind === "barricade")
-    .map(n => n.id);
+  // barricades: initial run-nodes (board.kind==="board" && flags.run===true)
+// IMPORTANT: In our board.json, barricade fields are encoded as board-nodes with flags.run=true.
+const barricades = (BOARD.nodes || [])
+  .filter(n => n.kind === "board" && n.flags && n.flags.run === true)
+  .map(n => n.id);
 
-  const turnColor = finalOrder[randInt(0, finalOrder.length - 1)];
+const turnColor = finalOrder[randInt(0, finalOrder.length - 1)];
 
   room.lastRollWasSix = false;
 
@@ -829,13 +830,24 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       if (!canStart(room)) { send(ws, { type: "error", code: "NEED_2P", message: "Mindestens 2 Spieler nötig" }); return; }
 
       // IMPORTANT: If a game was restored (firebase/disk), do NOT re-initialize the state here.
-      // Otherwise we would wipe barricades/pawns and other progress.
-      if (room.state && room.state.started) {
-        await persistRoomState(room);
-        console.log(`[start] room=${room.code} (restored) keep existing state, turn=${room.state.turnColor}`);
-        broadcast(room, { type: "started", state: room.state });
-        return;
-      }
+// Otherwise we would wipe barricades/pawns and other progress.
+// Some older saves may not have `started:true` set, so we detect a "real" game state by structure.
+const looksRestored =
+  !!room.state &&
+  (room.state.started === true ||
+    (Array.isArray(room.state.pieces) && room.state.pieces.length > 0 && !!room.state.turnColor && !!room.state.phase && Array.isArray(room.state.barricades)));
+
+if (looksRestored) {
+  // Normalize legacy saves
+  room.state.started = true;
+  ensureCarryingInState(room);
+  ensureBarricadesInState(room);
+  await persistRoomState(room);
+  console.log(`[start] room=${room.code} (restored) keep existing state, turn=${room.state.turnColor}`);
+  broadcast(room, { type: "started", state: room.state });
+  return;
+}
+
 
       initGameState(room);
       await persistRoomState(room);
