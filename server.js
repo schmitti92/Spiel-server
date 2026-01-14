@@ -829,27 +829,23 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann starten" }); return; }
       if (!canStart(room)) { send(ws, { type: "error", code: "NEED_2P", message: "Mindestens 2 Spieler nötig" }); return; }
 
-      // IMPORTANT: If a game was restored (firebase/disk), do NOT re-initialize the state here.
-// Otherwise we would wipe barricades/pawns and other progress.
-// Some older saves may not have `started:true` set, so we detect a "real" game state by structure.
-const looksRestored =
-  !!room.state &&
-  (room.state.started === true ||
-    (Array.isArray(room.state.pieces) && room.state.pieces.length > 0 && !!room.state.turnColor && !!room.state.phase && Array.isArray(room.state.barricades)));
+      
 
-if (looksRestored) {
-  // Normalize legacy saves
-  room.state.started = true;
-  ensureCarryingInState(room);
-  ensureBarricadesInState(room);
-  await persistRoomState(room);
-  console.log(`[start] room=${room.code} (restored) keep existing state, turn=${room.state.turnColor}`);
-  broadcast(room, { type: "started", state: room.state });
-  return;
-}
+      // IMPORTANT: If there is already a game state (restored from Firebase/disk),
+      // then the "start" button must behave like RESUME.
+      // Never re-initialize here, otherwise barricades/pawns get wiped.
+      if (room.state) {
+        room.state.started = true;
+        room.state.paused = false;
+        ensureCarryingInState(room);
+        ensureBarricadesInState(room);
+        await persistRoomState(room);
+        console.log(`[start] room=${room.code} (resume existing) turn=${room.state.turnColor}`);
+        broadcast(room, { type: "started", state: room.state });
+        return;
+      }
 
-
-      initGameState(room);
+      initGameState(room);initGameState(room);
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
