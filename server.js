@@ -82,31 +82,6 @@ async function persistRoomState(room){
     // Revision counter (monotonic, used for stale snapshot protection)
     if (typeof room.state.rev !== "number") room.state.rev = 0;
     room.state.rev += 1;
-    // ---- meta persistence (reconnect-safe) ----
-    // Keep identity binding separate from cosmetic color switching.
-    // We store stable player tokens + host token in state.meta so Firestore restore can rebuild room assignments.
-    try{
-      if(!room.state.meta || typeof room.state.meta !== "object") room.state.meta = {};
-      if(room.hostToken) room.state.meta.hostToken = room.hostToken;
-
-      // tokenToColor is optional; helps restore cosmetic colors after restart
-      if(!room.state.meta.tokenToColor || typeof room.state.meta.tokenToColor !== "object") room.state.meta.tokenToColor = {};
-
-      // Persist locked player tokens (variant A: exactly 2 tokens bind a running room)
-      if(!Array.isArray(room.state.meta.players)) room.state.meta.players = [];
-      const toks = Array.from(room.players.values()).map(p=>p.sessionToken).filter(Boolean);
-      for(const t of toks){
-        if(!room.state.meta.players.includes(t) && room.state.meta.players.length < 2){
-          room.state.meta.players.push(t);
-        }
-      }
-      // If we have a player->color mapping in memory, refresh it
-      for(const p of room.players.values()){
-        if(p.sessionToken && p.color){
-          room.state.meta.tokenToColor[p.sessionToken] = p.color;
-        }
-      }
-    }catch(_e){}
 
     const file = savePathForRoom(room.code);
     const payload = { code: room.code, ts: Date.now(), state: room.state };
@@ -132,6 +107,32 @@ async function persistRoomState(room){
   }
 }
 
+
+function ensureCarryingInState(room){
+  try{
+    if(!room || !room.state) return;
+
+    const had = !!(room.state.carryingByColor && typeof room.state.carryingByColor === "object");
+    if(!had){
+      room.state.carryingByColor = { red:false, blue:false, green:false, yellow:false };
+    }else{
+      for (const c of ["red","blue","green","yellow"]) {
+        if (typeof room.state.carryingByColor[c] !== "boolean") room.state.carryingByColor[c] = false;
+      }
+    }
+
+    // 🔧 Recovery for older saves: if the game is currently waiting for barricade placement
+    // but the carried-flag is missing/false, assume the current turn color is carrying.
+    if(room.state.phase === "place_barricade"){
+      const tc = String(room.state.turnColor || "");
+      if(tc && ["red","blue","green","yellow"].includes(tc) && room.state.carryingByColor[tc] !== true){
+        room.state.carryingByColor[tc] = true;
+      }
+    }
+  }catch(_e){}
+}
+
+
 async function restoreRoomState(room){
   // Prefer Firestore when enabled; otherwise disk.
   try{
@@ -142,15 +143,7 @@ async function restoreRoomState(room){
       const data = snap.exists ? snap.data() : null;
       if (data?.state && typeof data.state === "object") {
         room.state = data.state;
-
-        // restore host token binding (reconnect-safe)
-        try{
-          const mt = room?.state?.meta;
-          if(mt && typeof mt === "object"){
-            if(mt.hostToken && !room.hostToken) room.hostToken = String(mt.hostToken);
-          }
-        }catch(_e){}
-
+        ensureCarryingInState(room);
         return true;
       }
     }
@@ -166,15 +159,7 @@ async function restoreRoomState(room){
     const payload = JSON.parse(raw);
     if(payload && payload.state && typeof payload.state === "object"){
       room.state = payload.state;
-
-        // restore host token binding (reconnect-safe)
-        try{
-          const mt = room?.state?.meta;
-          if(mt && typeof mt === "object"){
-            if(mt.hostToken && !room.hostToken) room.hostToken = String(mt.hostToken);
-          }
-        }catch(_e){}
-
+      ensureCarryingInState(room);
       return true;
     }
   }catch(_e){}
@@ -229,6 +214,8 @@ for (const [a, b] of EDGES) {
 const STARTS = BOARD.meta?.starts || {};
 const GOAL = BOARD.meta?.goal || null;
 
+const ALL_COLORS = ["red","blue","green","yellow"];
+
 const HOUSE_BY_COLOR = (() => {
   const map = { red: [], blue: [], green: [], yellow: [] };
   for (const n of BOARD.nodes || []) {
@@ -260,7 +247,7 @@ function makeRoom(code) {
     players: new Map(), // clientId -> {id,name,color,isHost,sessionToken,lastSeen}
     state: null,
     lastRollWasSix: false,
-    carryingByColor: { red: false, blue: false },
+    carryingByColor: { red: false, blue: false, green: false, yellow: false },
   };
 }
 
@@ -299,6 +286,24 @@ function canStart(room) {
 function enforcePauseIfNotReady(room){
   try{
     if(!room?.state) return;
+
+    // During a running game, we require ALL active colors to be connected.
+    const active = Array.isArray(room.state.activeColors) && room.state.activeColors.length
+      ? room.state.activeColors
+      : null;
+
+    if (active) {
+      const connectedColors = new Set(
+        Array.from(room.players.values())
+          .filter(p => p.color && isConnectedPlayer(p))
+          .map(p => p.color)
+      );
+      const allConnected = active.every(c => connectedColors.has(c));
+      if (!allConnected) room.state.paused = true;
+      return;
+    }
+
+    // Fallback (legacy): at least 2 connected colored players
     const ready = canStart(room);
     if(!ready) room.state.paused = true;
   }catch(_e){}
@@ -332,21 +337,42 @@ function assignColorsRandom(room) {
   const connected = Array.from(room.players.values()).filter(p => isConnectedPlayer(p));
   for (const p of connected) p.color = null;
   if (connected.length === 0) return;
-  if (connected.length > 2) connected.length = 2;
+
+  // Limit to max 4 players (red/blue/green/yellow)
+  if (connected.length > ALL_COLORS.length) connected.length = ALL_COLORS.length;
 
   shuffleInPlace(connected);
-  const first = connected[0];
-  const second = connected[1] || null;
-  const firstColor = (Math.random() < 0.5) ? "red" : "blue";
-  first.color = firstColor;
-  if (second) second.color = (firstColor === "red") ? "blue" : "red";
+  const colors = [...ALL_COLORS];
+  shuffleInPlace(colors);
+
+  for (let i = 0; i < connected.length; i++) {
+    connected[i].color = colors[i];
+  }
 }
 
 /** ---------- Game state ---------- **/
 function initGameState(room) {
-  // pieces 5 per color in house
+  // Determine which colors are actually playing (connected + have a color assigned)
+  const activeColors = Array.from(room.players.values())
+    .filter(p => p.color && isConnectedPlayer(p))
+    .map(p => String(p.color).toLowerCase());
+
+  const uniq = [];
+  const seen = new Set();
+  for (const c of activeColors) {
+    if (!ALL_COLORS.includes(c)) continue;
+    if (seen.has(c)) continue;
+    seen.add(c);
+    uniq.push(c);
+  }
+
+  // At least 2 players to start; if something goes wrong, fall back to red/blue
+  const turnOrder = ALL_COLORS.filter(c => uniq.includes(c));
+  const finalOrder = (turnOrder.length >= 2) ? turnOrder : ["red", "blue"];
+
+  // pieces: 5 per active color in house
   const pieces = [];
-  for (const color of ["red", "blue"]) {
+  for (const color of finalOrder) {
     const houses = (BOARD.nodes || [])
       .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
       .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
@@ -363,20 +389,21 @@ function initGameState(room) {
     }
   }
 
-  // barricades: all run nodes
+  // barricades: from board
   const barricades = (BOARD.nodes || [])
-    .filter(n => n.kind === "board" && n.flags?.run)
+    .filter(n => n.kind === "barricade")
     .map(n => n.id);
 
-  // choose starter
-  const turnColor = (Math.random() < 0.5) ? "red" : "blue";
+  const turnColor = finalOrder[randInt(0, finalOrder.length - 1)];
 
   room.lastRollWasSix = false;
-  room.carryingByColor = { red: false, blue: false };
 
   room.state = {
     started: true,
     paused: false,
+    carryingByColor: { red: false, blue: false, green: false, yellow: false },
+    activeColors: finalOrder,
+    turnOrder: finalOrder,
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -386,6 +413,16 @@ function initGameState(room) {
   };
 }
 
+function nextTurnColor(room, current){
+  const order = Array.isArray(room?.state?.turnOrder) && room.state.turnOrder.length
+    ? room.state.turnOrder
+    : ALL_COLORS;
+  const idx = order.indexOf(current);
+  if (idx === -1) return order[0] || current;
+  return order[(idx + 1) % order.length] || current;
+}
+
+// legacy helper (2-player); kept for backward compatibility in old saves
 function otherColor(c) { return c === "red" ? "blue" : "red"; }
 function getPiece(room, pieceId) {
   return room.state?.pieces?.find(p => p.id === pieceId) || null;
@@ -592,19 +629,6 @@ wss.on("connection", (ws) => {
       if (existing) room.players.delete(existing.id);
       const existingColor = existing?.color || null;
 
-      // ---- Variant A: hard bind room to 2 stable sessionTokens (playerIds) ----
-      // If the room already has two bound players in persisted meta, block any new token.
-      try{
-        const bound = room?.state?.meta?.players;
-        if (Array.isArray(bound) && bound.length >= 2) {
-          if (sessionToken && !bound.includes(sessionToken)) {
-            send(ws, { type: "error", code: "ROOM_LOCKED", message: "Raum läuft bereits (2 Spieler gebunden)." });
-            return;
-          }
-        }
-      }catch(_e){}
-
-
       
 // host assignment (stable, server-chef):
 // - host is bound to room.hostToken (sessionToken)
@@ -630,19 +654,11 @@ if (isHost) {
   for (const p of room.players.values()) p.isHost = false;
 }
 
-// color assignment (strict 2 players, no spectator)
-const COLORS = ["red", "blue"];
+// color assignment (up to 4 players)
+const COLORS = ALL_COLORS;
 
 // If reconnecting via sessionToken, keep the exact previous color
 let color = existing?.color || null;
-
-// If server restarted, try restore cosmetic color from persisted meta
-if(!color){
-  try{
-    const tc = room?.state?.meta?.tokenToColor;
-    if(tc && sessionToken && tc[sessionToken]) color = String(tc[sessionToken]);
-  }catch(_e){}
-}
 
 if (!color) {
   // remove offline placeholders that hold a color, so slots become available
@@ -656,14 +672,14 @@ if (!color) {
 
   // If two colored players are CONNECTED, room is full
   const connectedColored = Array.from(room.players.values()).filter(p => p.color && isConnectedPlayer(p));
-  if (connectedColored.length >= 2) {
-    send(ws, { type: "error", code: "ROOM_FULL", message: "Raum ist voll (max. 2 Spieler)." });
+  if (connectedColored.length >= COLORS.length) {
+    send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max. ${COLORS.length} Spieler).` });
     return;
   }
 
   // assign remaining free color
   if (usedNow.length === 0) {
-    color = COLORS[randInt(0, 1)];
+    color = COLORS[randInt(0, COLORS.length - 1)];
   } else {
     color = COLORS.find(cc => !usedNow.includes(cc)) || null;
   }
@@ -676,19 +692,6 @@ if (!color) {
 }
 
 room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, lastSeen: Date.now() });
-
-      // persist bound players immediately (Variant A)
-      try{
-        if(room.state){
-          if(!room.state.meta || typeof room.state.meta !== "object") room.state.meta = {};
-          if(!Array.isArray(room.state.meta.players)) room.state.meta.players = [];
-          if(sessionToken && !room.state.meta.players.includes(sessionToken) && room.state.meta.players.length < 2){
-            room.state.meta.players.push(sessionToken);
-          }
-          if(isHost && sessionToken) room.state.meta.hostToken = sessionToken;
-        }
-      }catch(_e){}
-
       // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
       c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
 
@@ -730,7 +733,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann Slots zuweisen" }); return; }
 
       const targetColor = String(msg.color || msg.targetColor || "").toLowerCase().trim();
-      if (targetColor !== "red" && targetColor !== "blue") {
+      if (!ALL_COLORS.includes(targetColor)) {
         send(ws, { type: "error", code: "BAD_COLOR", message: "Ungültige Farbe" });
         return;
       }
@@ -791,7 +794,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       room.state = null;
       room.lastRollWasSix = false;
-      room.carryingByColor = { red: false, blue: false };
+      room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
       assignColorsRandom(room);
 
       console.log(`[reset] room=${room.code} by=host`);
@@ -854,7 +857,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       room.lastRollWasSix = false;
       room.state.rolled = null;
       room.state.phase = "need_roll";
-      room.state.turnColor = otherColor(room.state.turnColor);
+      room.state.turnColor = nextTurnColor(room, room.state.turnColor);
 
       await persistRoomState(room);
     broadcast(room, { type: "move", state: room.state });
@@ -975,7 +978,7 @@ if (msg.type === "move_request") {
       if (idx >= 0) {
         barricades.splice(idx, 1);
         picked = true;
-        room.carryingByColor[pc.color] = true;
+        room.state.carryingByColor[pc.color] = true;
         room.state.phase = "place_barricade";
       } else {
         room.state.phase = "need_roll";
@@ -986,7 +989,7 @@ if (msg.type === "move_request") {
         if (room.lastRollWasSix) {
           room.state.turnColor = pc.color; // extra roll
         } else {
-          room.state.turnColor = otherColor(pc.color);
+          room.state.turnColor = nextTurnColor(room, pc.color);
         }
         room.state.phase = "need_roll";
         room.state.rolled = null;
@@ -1027,7 +1030,7 @@ if (msg.type === "place_barricade") {
     return;
   }
 
-  if (!room.carryingByColor[color]) {
+  if (!room.state.carryingByColor[color]) {
     send(ws, { type: "error", code: "NO_BARRICADE", message: "Du trägst keine Barikade" });
     return;
   }
@@ -1096,10 +1099,10 @@ if (msg.type === "place_barricade") {
 
   // ✅ platzieren
   room.state.barricades.push(nodeId);
-  room.carryingByColor[color] = false;
+  room.state.carryingByColor[color] = false;
 
   // ✅ weiter
-  room.state.turnColor = room.lastRollWasSix ? color : otherColor(color);
+  room.state.turnColor = room.lastRollWasSix ? color : nextTurnColor(room, color);
   room.state.phase = "need_roll";
   room.state.rolled = null;
 
