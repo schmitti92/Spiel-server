@@ -673,10 +673,6 @@ if (isHost) {
 }
 
 // color assignment (up to 4 players)
-// IMPORTANT: Classic behavior requested by user:
-// - Host is ALWAYS red
-// - Join order for additional players: blue -> green -> yellow
-// - Red is reserved for host (never assigned to non-host)
 const COLORS = ALL_COLORS;
 
 // If reconnecting via sessionToken, keep the exact previous color
@@ -690,39 +686,52 @@ if (!color) {
     }
   }
 
-  // colors currently used (connected OR placeholders that are still connected)
   const usedNow = Array.from(room.players.values()).map(p => p.color).filter(Boolean);
 
-  // capacity check: only counts CONNECTED colored players
+  // If two colored players are CONNECTED, room is full
   const connectedColored = Array.from(room.players.values()).filter(p => p.color && isConnectedPlayer(p));
   if (connectedColored.length >= COLORS.length) {
     send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max. ${COLORS.length} Spieler).` });
     return;
   }
 
-  // Host must be red (reserved)
+  // deterministic classic assignment:
+  // - Host is ALWAYS red
+  // - Join order for additional players: blue, green, yellow
+  // - Non-host players can never take red (reserved for host)
+  const ORDER = ["red", "blue", "green", "yellow"];
+  const NON_HOST_ORDER = ["blue", "green", "yellow"];
+
+  // If host joins but red is currently held by a connected non-host (from older versions),
+  // we auto-reassign that player to the next available non-host color (to avoid breaking the room).
   if (isHost) {
-    // If someone else already holds red, we can only auto-fix BEFORE the game starts.
-    const redHolder = Array.from(room.players.values()).find(p => p.color === "red" && p.id !== clientId);
-    const gameStarted = !!(room.state && room.state.started);
-    if (redHolder && !gameStarted) {
-      // move that player to the first free non-red color
-      const freeNonRed = ["blue","green","yellow"].find(c => !usedNow.includes(c)) || null;
-      if (freeNonRed) {
-        redHolder.color = freeNonRed;
-      } else {
-        send(ws, { type: "error", code: "NO_COLOR", message: "Keine Farbe verfügbar (Rot ist für Host reserviert)." });
+    const redHolder = Array.from(room.players.values()).find(p => p.color === "red" && !p.isHost && isConnectedPlayer(p));
+    if (redHolder) {
+      const usedSet = new Set(usedNow);
+      usedSet.delete("red");
+      let reassigned = null;
+      for (const cc of NON_HOST_ORDER) {
+        if (!usedSet.has(cc)) { reassigned = cc; break; }
+      }
+      if (!reassigned) {
+        send(ws, { type: "error", code: "ROOM_FULL", message: `Rot ist belegt und keine Ersatzfarbe frei (max. ${COLORS.length} Spieler).` });
         return;
       }
-    } else if (redHolder && gameStarted) {
-      // Do NOT reshuffle colors mid-game
-      send(ws, { type: "error", code: "RED_RESERVED", message: "Rot ist für den Host reserviert. Bitte einen Raum neu starten oder den Host-Token prüfen." });
-      return;
+      redHolder.color = reassigned;
+      // update usedNow to reflect reassignment
+      for (let i = 0; i < usedNow.length; i++) if (usedNow[i] === "red") { usedNow[i] = reassigned; break; }
     }
+  }
+
+  if (isHost) {
     color = "red";
   } else {
-    // Non-host players: blue -> green -> yellow (never red)
-    color = ["blue","green","yellow"].find(c => !usedNow.includes(c)) || null;
+    const usedSet = new Set(usedNow);
+    let picked = null;
+    for (const cc of NON_HOST_ORDER) {
+      if (!usedSet.has(cc)) { picked = cc; break; }
+    }
+    color = picked;
   }
 }
 
@@ -818,6 +827,15 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       const me = room.players.get(clientId);
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann starten" }); return; }
       if (!canStart(room)) { send(ws, { type: "error", code: "NEED_2P", message: "Mindestens 2 Spieler nötig" }); return; }
+
+      // IMPORTANT: If a game was restored (firebase/disk), do NOT re-initialize the state here.
+      // Otherwise we would wipe barricades/pawns and other progress.
+      if (room.state && room.state.started) {
+        await persistRoomState(room);
+        console.log(`[start] room=${room.code} (restored) keep existing state, turn=${room.state.turnColor}`);
+        broadcast(room, { type: "started", state: room.state });
+        return;
+      }
 
       initGameState(room);
       await persistRoomState(room);
