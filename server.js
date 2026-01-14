@@ -132,6 +132,21 @@ function ensureCarryingInState(room){
   }catch(_e){}
 }
 
+function ensureBarricadesInState(room){
+  try{
+    if(!room || !room.state) return;
+    // Barricades are essential for move legality. If missing after restore, reconstruct from board.json.
+    if(!Array.isArray(room.state.barricades) || room.state.barricades.length === 0){
+      room.state.barricades = Array.from(DEFAULT_BARRICADES);
+      return;
+    }
+    // filter invalid ids (defensive)
+    room.state.barricades = room.state.barricades
+      .map(x => String(x))
+      .filter(id => NODES.has(id));
+  }catch(_e){}
+}
+
 
 async function restoreRoomState(room){
   // Prefer Firestore when enabled; otherwise disk.
@@ -144,6 +159,7 @@ async function restoreRoomState(room){
       if (data?.state && typeof data.state === "object") {
         room.state = data.state;
         ensureCarryingInState(room);
+        ensureBarricadesInState(room);
         return true;
       }
     }
@@ -160,6 +176,7 @@ async function restoreRoomState(room){
     if(payload && payload.state && typeof payload.state === "object"){
       room.state = payload.state;
       ensureCarryingInState(room);
+      ensureBarricadesInState(room);
       return true;
     }
   }catch(_e){}
@@ -202,6 +219,7 @@ const boardPath = path.join(process.cwd(), "board.json");
 const BOARD = JSON.parse(fs.readFileSync(boardPath, "utf-8"));
 const NODES = new Map((BOARD.nodes || []).map(n => [n.id, n]));
 const EDGES = BOARD.edges || [];
+const DEFAULT_BARRICADES = (BOARD.nodes || []).filter(n => n.kind === "barricade").map(n => n.id);
 const ADJ = new Map();
 
 for (const [a, b] of EDGES) {
