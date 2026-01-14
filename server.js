@@ -673,6 +673,10 @@ if (isHost) {
 }
 
 // color assignment (up to 4 players)
+// IMPORTANT: Classic behavior requested by user:
+// - Host is ALWAYS red
+// - Join order for additional players: blue -> green -> yellow
+// - Red is reserved for host (never assigned to non-host)
 const COLORS = ALL_COLORS;
 
 // If reconnecting via sessionToken, keep the exact previous color
@@ -686,20 +690,39 @@ if (!color) {
     }
   }
 
+  // colors currently used (connected OR placeholders that are still connected)
   const usedNow = Array.from(room.players.values()).map(p => p.color).filter(Boolean);
 
-  // If two colored players are CONNECTED, room is full
+  // capacity check: only counts CONNECTED colored players
   const connectedColored = Array.from(room.players.values()).filter(p => p.color && isConnectedPlayer(p));
   if (connectedColored.length >= COLORS.length) {
     send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max. ${COLORS.length} Spieler).` });
     return;
   }
 
-  // assign remaining free color
-  if (usedNow.length === 0) {
-    color = COLORS[randInt(0, COLORS.length - 1)];
+  // Host must be red (reserved)
+  if (isHost) {
+    // If someone else already holds red, we can only auto-fix BEFORE the game starts.
+    const redHolder = Array.from(room.players.values()).find(p => p.color === "red" && p.id !== clientId);
+    const gameStarted = !!(room.state && room.state.started);
+    if (redHolder && !gameStarted) {
+      // move that player to the first free non-red color
+      const freeNonRed = ["blue","green","yellow"].find(c => !usedNow.includes(c)) || null;
+      if (freeNonRed) {
+        redHolder.color = freeNonRed;
+      } else {
+        send(ws, { type: "error", code: "NO_COLOR", message: "Keine Farbe verfügbar (Rot ist für Host reserviert)." });
+        return;
+      }
+    } else if (redHolder && gameStarted) {
+      // Do NOT reshuffle colors mid-game
+      send(ws, { type: "error", code: "RED_RESERVED", message: "Rot ist für den Host reserviert. Bitte einen Raum neu starten oder den Host-Token prüfen." });
+      return;
+    }
+    color = "red";
   } else {
-    color = COLORS.find(cc => !usedNow.includes(cc)) || null;
+    // Non-host players: blue -> green -> yellow (never red)
+    color = ["blue","green","yellow"].find(c => !usedNow.includes(c)) || null;
   }
 }
 
