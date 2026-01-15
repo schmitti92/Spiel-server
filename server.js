@@ -846,22 +846,27 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       }
 
       initGameState(room);
-      await persistRoomState(room);
+await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
       return;
     }
 
     if (msg.type === "reset") {
-    // reset = neues Spiel, überschreibt Save
-    await deletePersisted(room);
-
+      // reset = neues Spiel, überschreibt Save
       const me = room.players.get(clientId);
-      if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann resetten" }); return; }
+      if (!me?.isHost) {
+        send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann resetten" });
+        return;
+      }
+
+      // IMPORTANT: erst Host prüfen, dann persistente Saves löschen
+      await deletePersisted(room);
 
       room.state = null;
       room.lastRollWasSix = false;
-      room.carryingByColor = { red: false, blue: false, green: false, yellow: false };
+
+      // Farben neu zuweisen (nur für aktuell verbundene Spieler)
       assignColorsRandom(room);
 
       console.log(`[reset] room=${room.code} by=host`);
