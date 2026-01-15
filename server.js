@@ -117,6 +117,11 @@ async function restoreRoomState(room){
       const data = snap.exists ? snap.data() : null;
       if (data?.state && typeof data.state === "object") {
         room.state = data.state;
+        // Backward-compat + safety defaults
+        if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
+          room.state.carryingByColor = { red: false, blue: false };
+        }
+        room.carryingByColor = room.state.carryingByColor;
         return true;
       }
     }
@@ -132,6 +137,10 @@ async function restoreRoomState(room){
     const payload = JSON.parse(raw);
     if(payload && payload.state && typeof payload.state === "object"){
       room.state = payload.state;
+      if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
+        room.state.carryingByColor = { red: false, blue: false };
+      }
+      room.carryingByColor = room.state.carryingByColor;
       return true;
     }
   }catch(_e){}
@@ -217,6 +226,8 @@ function makeRoom(code) {
     players: new Map(), // clientId -> {id,name,color,isHost,sessionToken,lastSeen}
     state: null,
     lastRollWasSix: false,
+    // Backward-compat field. Source of truth is room.state.carryingByColor
+    // because only room.state is persisted to disk/Firebase.
     carryingByColor: { red: false, blue: false },
   };
 }
@@ -329,7 +340,9 @@ function initGameState(room) {
   const turnColor = (Math.random() < 0.5) ? "red" : "blue";
 
   room.lastRollWasSix = false;
-  room.carryingByColor = { red: false, blue: false };
+  // IMPORTANT: carrying must survive restart -> store in room.state (persisted)
+  const carryingByColor = { red: false, blue: false };
+  room.carryingByColor = carryingByColor; // backward-compat alias
 
   room.state = {
     started: true,
@@ -340,6 +353,7 @@ function initGameState(room) {
     pieces,
     barricades,
     goal: GOAL,
+    carryingByColor,
   };
 }
 
@@ -898,7 +912,12 @@ if (msg.type === "move_request") {
       if (idx >= 0) {
         barricades.splice(idx, 1);
         picked = true;
-        room.carryingByColor[pc.color] = true;
+        // Persist the "carrying" flag inside state (so it survives restart)
+        if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
+          room.state.carryingByColor = { red: false, blue: false };
+        }
+        room.state.carryingByColor[pc.color] = true;
+        room.carryingByColor = room.state.carryingByColor; // compat alias
         room.state.phase = "place_barricade";
       } else {
         room.state.phase = "need_roll";
@@ -950,7 +969,13 @@ if (msg.type === "place_barricade") {
     return;
   }
 
-  if (!room.carryingByColor[color]) {
+  // carrying flag is persisted in room.state
+  if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
+    room.state.carryingByColor = { red: false, blue: false };
+  }
+  room.carryingByColor = room.state.carryingByColor; // compat alias
+
+  if (!room.state.carryingByColor[color]) {
     send(ws, { type: "error", code: "NO_BARRICADE", message: "Du trägst keine Barikade" });
     return;
   }
@@ -1019,7 +1044,8 @@ if (msg.type === "place_barricade") {
 
   // ✅ platzieren
   room.state.barricades.push(nodeId);
-  room.carryingByColor[color] = false;
+  room.state.carryingByColor[color] = false;
+  room.carryingByColor = room.state.carryingByColor; // compat alias
 
   // ✅ weiter
   room.state.turnColor = room.lastRollWasSix ? color : otherColor(color);
