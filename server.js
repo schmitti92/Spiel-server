@@ -845,7 +845,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      initGameState(room);initGameState(room);
+      initGameState(room);
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
@@ -861,7 +861,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       room.state = null;
       room.lastRollWasSix = false;
-      room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
+      room.carryingByColor = { red: false, blue: false, green: false, yellow: false };
       assignColorsRandom(room);
 
       console.log(`[reset] room=${room.code} by=host`);
