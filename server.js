@@ -6,6 +6,7 @@ import { WebSocketServer } from "ws";
 import admin from "firebase-admin";
 
 const PORT = process.env.PORT || 10000;
+const MAX_PLAYERS = 3; // 3-Spieler-Limit
 
 // ---------- Player Colors (Lobby Selection) ----------
 // WICHTIG (Christoph-Wunsch): KEINE automatische Farbe mehr beim Join.
@@ -17,7 +18,7 @@ const PORT = process.env.PORT || 10000;
 // noch nicht als Spiel-Farben aktiv.
 // -> Sobald wir 3/4 Spieler aktivieren, erweitern wir hier ALLOWED_COLORS und
 //    passen Turn-Reihenfolge + Regeln additiv an.
-const ALLOWED_COLORS = ["red", "blue"];\nconst MAX_PLAYERS = 3; // Schritt 1: 3-Spieler erlauben
+const ALLOWED_COLORS = ["red", "blue", "green"]; // 3-Spieler: Grün aktiviert
 
 function roomUpdatePayload(room, playersOverride) {
   return {
@@ -321,21 +322,32 @@ function assignColorsRandom(room) {
   const connected = Array.from(room.players.values()).filter(p => isConnectedPlayer(p));
   for (const p of connected) p.color = null;
   if (connected.length === 0) return;
-  if (connected.length > 2) connected.length = 2;
+  if (connected.length > MAX_PLAYERS) connected.length = MAX_PLAYERS;
 
   shuffleInPlace(connected);
   const first = connected[0];
   const second = connected[1] || null;
-  const firstColor = (Math.random() < 0.5) ? "red" : "blue";
+  const palette = ["red","blue","green"].slice(0, MAX_PLAYERS);
+  const firstColor = palette[Math.floor(Math.random()*palette.length)];
   first.color = firstColor;
-  if (second) second.color = (firstColor === "red") ? "blue" : "red";
+  if (second) second.color = palette.find(c => c !== firstColor) || "blue";
+  const third = connected[2] || null;
+  if (third) third.color = palette.find(c => c !== firstColor && c !== (second?.color)) || "green";
 }
 
 /** ---------- Game state ---------- **/
 function initGameState(room) {
   // pieces 5 per color in house
   const pieces = [];
-  for (const color of ["red", "blue"]) {
+  // Active colors are derived from connected/claimed player colors at game start.
+  const ORDER = ["red","blue","green","yellow"];
+  const activeColors = Array.from(new Set(Array.from(room.players.values()).map(p => p.color).filter(Boolean)))
+    .filter(c => ALLOWED_COLORS.includes(c))
+    .sort((a,b)=>ORDER.indexOf(a)-ORDER.indexOf(b));
+  if (activeColors.length < 2) activeColors.push("red","blue");
+  room._activeColors = Array.from(new Set(activeColors));
+
+  for (const color of room._activeColors) {
     const houses = (BOARD.nodes || [])
       .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
       .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
@@ -357,21 +369,18 @@ function initGameState(room) {
     .filter(n => n.kind === "board" && n.flags?.run)
     .map(n => n.id);
 
-  // choose starter (Schritt 2: 2-3 Spieler)
-  const activeColors = getActiveColors(room);
-  const turnColor = activeColors.length
-    ? activeColors[Math.floor(Math.random() * activeColors.length)]
-    : "red";
+  // choose starter
+  const turnColor = room._activeColors[Math.floor(Math.random()*room._activeColors.length)];
 
   room.lastRollWasSix = false;
   // IMPORTANT: carrying must survive restart -> store in room.state (persisted)
-  const carryingByColor = {};
-  for (const c of activeColors.length ? activeColors : ["red","blue"]) carryingByColor[c] = false;
+  const carryingByColor = Object.fromEntries(room._activeColors.map(c => [c,false]));
   room.carryingByColor = carryingByColor; // backward-compat alias
 
   room.state = {
     started: true,
     paused: false,
+    activeColors: room._activeColors,
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -382,38 +391,30 @@ function initGameState(room) {
   };
 }
 
-
-// Schritt 2: Turn-Reihenfolge für 2-3 Spieler (ohne bestehende 2P-Logik zu brechen)
-const COLOR_PRIORITY = ["red", "blue", "green", "yellow"];
-
-function hasConnectedColor(room, color) {
-  return Array.from(room.players.values()).some(p => p.color === color && isConnectedPlayer(p));
+function activeColorsOf(room){
+  const ORDER = ["red","blue","green","yellow"];
+  const arr = room.state?.activeColors || room._activeColors || [];
+  const uniq = Array.from(new Set(arr.filter(Boolean)));
+  return uniq.sort((a,b)=>ORDER.indexOf(a)-ORDER.indexOf(b));
 }
-
-function getActiveColors(room) {
-  // Active = Farbe ist im Raum vergeben (auch wenn Client kurz offline ist)
-  const used = new Set(Array.from(room.players.values()).filter(p => p.color).map(p => p.color));
-  const ordered = COLOR_PRIORITY.filter(c => used.has(c));
-  // Fallback (Altstände ohne Farbenliste)
-  return ordered.length ? ordered : ["red", "blue"];
-}
-
-function nextTurnColor(room, current) {
-  const order = getActiveColors(room);
-  if (!order.length) return current || "red";
-  let i = order.indexOf(current);
-  if (i < 0) i = 0;
-
-  // Nächstes in der Liste suchen, das auch verbunden ist (sonst würde Spiel hängen)
-  for (let step = 1; step <= order.length; step++) {
-    const cand = order[(i + step) % order.length];
-    if (hasConnectedColor(room, cand)) return cand;
+function isColorConnected(room, color){
+  for (const p of room.players.values()){
+    if (p.color === color && isConnectedPlayer(p)) return true;
   }
-  // Wenn niemand verbunden ist, bleib beim aktuellen (Pause greift ohnehin)
-  return current || order[0] || "red";
+  return false;
+}
+function nextTurnColor(room, current){
+  const colors = activeColorsOf(room);
+  if (!colors.length) return current || "red";
+  const startIdx = Math.max(0, colors.indexOf(current));
+  for (let step=1; step<=colors.length; step++){
+    const cand = colors[(startIdx + step) % colors.length];
+    if (isColorConnected(room, cand)) return cand;
+  }
+  // fallback: if none connected, keep current
+  return current || colors[0];
 }
 
-function otherColor(c) { return c === "red" ? "blue" : "red"; }
 function getPiece(room, pieceId) {
   return room.state?.pieces?.find(p => p.id === pieceId) || null;
 }
@@ -678,12 +679,6 @@ if (!color) {
     color = null;
   }
 }
-
-      // MAX_PLAYERS Guard (Schritt 1)
-      if (room.players.size >= MAX_PLAYERS && !existing) {
-        send(ws, { type: "error", code: "ROOM_FULL", message: "Raum ist voll" });
-        return;
-      }
 
 room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, lastSeen: Date.now() });
       // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
