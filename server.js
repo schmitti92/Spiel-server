@@ -7,6 +7,27 @@ import admin from "firebase-admin";
 
 const PORT = process.env.PORT || 10000;
 
+// ---------- Player Colors (Lobby Selection) ----------
+// WICHTIG (Christoph-Wunsch): KEINE automatische Farbe mehr beim Join.
+// Jeder (auch Host) wählt seine Farbe aktiv in der Lobby.
+// Reconnect via sessionToken behält die Farbe.
+//
+// AKTUELLER STAND: Der server-authoritative Turn-Flow ist derzeit auf 2 Farben
+// (red/blue) ausgelegt. Grün/Gelb sind im Client sichtbar, aber serverseitig
+// noch nicht als Spiel-Farben aktiv.
+// -> Sobald wir 3/4 Spieler aktivieren, erweitern wir hier ALLOWED_COLORS und
+//    passen Turn-Reihenfolge + Regeln additiv an.
+const ALLOWED_COLORS = ["red", "blue"];
+
+function roomUpdatePayload(room, playersOverride) {
+  return {
+    type: "room_update",
+    players: Array.isArray(playersOverride) ? playersOverride : currentPlayersList(room),
+    canStart: canStart(room),
+    allowedColors: ALLOWED_COLORS,
+  };
+}
+
 // ---------- Firebase (optional, but recommended for 100% Restore) ----------
 // IMPORTANT: We do NOT remove the existing disk save/restore.
 // Firebase is an additional, durable persistence layer.
@@ -538,7 +559,7 @@ wss.on("connection", (ws) => {
         const old = rooms.get(c.room);
         if (old) {
           old.players.delete(clientId);
-          broadcast(old, { type: "room_update", players: currentPlayersList(old), canStart: canStart(old) });
+          broadcast(old, roomUpdatePayload(old));
         }
       }
 
@@ -599,7 +620,7 @@ if (isHost) {
 //
 // NOTE: Das Board/Game-Logic in diesem Server arbeitet aktuell mit 2 Farben (red/blue).
 //       Weitere Farben koennen spaeter additiv freigeschaltet werden.
-const ALLOWED_COLORS = ["red", "blue"];
+//       (ALLOWED_COLORS ist global definiert.)
 
 // If reconnecting via sessionToken, keep the exact previous color
 let color = existing?.color || null;
@@ -636,8 +657,8 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       console.log(`[join] room=${roomCode} name=${name} host=${isHost} color=${color} existing=${!!existing}`);
 
-      send(ws, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
-      broadcast(room, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+      send(ws, roomUpdatePayload(room));
+      broadcast(room, roomUpdatePayload(room));
 
 
       if (room.state) send(ws, { type: "snapshot", state: room.state });
@@ -653,8 +674,8 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
     if (msg.type === "leave") {
       room.players.delete(clientId);
       c.room = null;
-      send(ws, { type: "room_update", players: [], canStart: false });
-      broadcast(room, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+      send(ws, roomUpdatePayload(room, []));
+      broadcast(room, roomUpdatePayload(room));
       return;
     }
 
@@ -697,7 +718,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       // If I'm already that color -> ok
       if (me.color === targetColor) {
-        send(ws, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+        send(ws, roomUpdatePayload(room));
         return;
       }
 
@@ -720,7 +741,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       // assign
       me.color = targetColor;
 
-      broadcast(room, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+      broadcast(room, roomUpdatePayload(room));
       await persistRoomState(room);
       return;
     }
@@ -753,7 +774,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       // (Reconnect/Token bleibt damit konsistent.)
 
       console.log(`[reset] room=${room.code} by=host`);
-      broadcast(room, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+      broadcast(room, roomUpdatePayload(room));
       broadcast(room, { type: "reset_done" });
       return;
     }
@@ -816,7 +837,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       await persistRoomState(room);
     broadcast(room, { type: "move", state: room.state });
-      broadcast(room, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+      broadcast(room, roomUpdatePayload(room));
       return;
     }
 
@@ -1109,7 +1130,7 @@ if (msg.type === "place_barricade") {
 
         // Reconnect-Sicherheit: sobald <2 Spieler verbunden sind → pausiert
         enforcePauseIfNotReady(room);
-        broadcast(room, { type: "room_update", players: currentPlayersList(room), canStart: canStart(room) });
+        broadcast(room, roomUpdatePayload(room));
         if (room.state) await persistRoomState(room);
     broadcast(room, { type: "snapshot", state: room.state });
       }
