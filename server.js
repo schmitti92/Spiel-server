@@ -6,7 +6,6 @@ import { WebSocketServer } from "ws";
 import admin from "firebase-admin";
 
 const PORT = process.env.PORT || 10000;
-const MAX_PLAYERS = 3; // 3-Spieler-Limit
 
 // ---------- Player Colors (Lobby Selection) ----------
 // WICHTIG (Christoph-Wunsch): KEINE automatische Farbe mehr beim Join.
@@ -18,7 +17,7 @@ const MAX_PLAYERS = 3; // 3-Spieler-Limit
 // noch nicht als Spiel-Farben aktiv.
 // -> Sobald wir 3/4 Spieler aktivieren, erweitern wir hier ALLOWED_COLORS und
 //    passen Turn-Reihenfolge + Regeln additiv an.
-const ALLOWED_COLORS = ["red", "blue", "green"]; // 3-Spieler: Grün aktiviert
+const ALLOWED_COLORS = ["red", "blue", "green"];
 
 function roomUpdatePayload(room, playersOverride) {
   return {
@@ -322,32 +321,22 @@ function assignColorsRandom(room) {
   const connected = Array.from(room.players.values()).filter(p => isConnectedPlayer(p));
   for (const p of connected) p.color = null;
   if (connected.length === 0) return;
-  if (connected.length > MAX_PLAYERS) connected.length = MAX_PLAYERS;
+  if (connected.length > 2) connected.length = 2;
 
   shuffleInPlace(connected);
   const first = connected[0];
   const second = connected[1] || null;
-  const palette = ["red","blue","green"].slice(0, MAX_PLAYERS);
-  const firstColor = palette[Math.floor(Math.random()*palette.length)];
+  const firstColor = (Math.random() < 0.5) ? "red" : "blue";
   first.color = firstColor;
-  if (second) second.color = palette.find(c => c !== firstColor) || "blue";
-  const third = connected[2] || null;
-  if (third) third.color = palette.find(c => c !== firstColor && c !== (second?.color)) || "green";
+  if (second) second.color = (firstColor === "red") ? "blue" : "red";
 }
 
 /** ---------- Game state ---------- **/
 function initGameState(room) {
   // pieces 5 per color in house
+  const turnOrder = computeTurnOrderFromRoom(room);
   const pieces = [];
-  // Active colors are derived from connected/claimed player colors at game start.
-  const ORDER = ["red","blue","green","yellow"];
-  const activeColors = Array.from(new Set(Array.from(room.players.values()).map(p => p.color).filter(Boolean)))
-    .filter(c => ALLOWED_COLORS.includes(c))
-    .sort((a,b)=>ORDER.indexOf(a)-ORDER.indexOf(b));
-  if (activeColors.length < 2) activeColors.push("red","blue");
-  room._activeColors = Array.from(new Set(activeColors));
-
-  for (const color of room._activeColors) {
+  for (const color of turnOrder) {
     const houses = (BOARD.nodes || [])
       .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
       .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
@@ -370,17 +359,17 @@ function initGameState(room) {
     .map(n => n.id);
 
   // choose starter
-  const turnColor = room._activeColors[Math.floor(Math.random()*room._activeColors.length)];
+  const turnColor = turnOrder[Math.floor(Math.random() * turnOrder.length)];
 
   room.lastRollWasSix = false;
   // IMPORTANT: carrying must survive restart -> store in room.state (persisted)
-  const carryingByColor = Object.fromEntries(room._activeColors.map(c => [c,false]));
+  const carryingByColor = { red: false, blue: false, green: false };
   room.carryingByColor = carryingByColor; // backward-compat alias
 
   room.state = {
     started: true,
     paused: false,
-    activeColors: room._activeColors,
+    turnOrder,
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -391,28 +380,26 @@ function initGameState(room) {
   };
 }
 
-function activeColorsOf(room){
-  const ORDER = ["red","blue","green","yellow"];
-  const arr = room.state?.activeColors || room._activeColors || [];
-  const uniq = Array.from(new Set(arr.filter(Boolean)));
-  return uniq.sort((a,b)=>ORDER.indexOf(a)-ORDER.indexOf(b));
+function getDefaultTurnOrder() { return ["red", "blue", "green"]; }
+
+function computeTurnOrderFromRoom(room) {
+  // Deterministic order: red -> blue -> green (only colors that are present)
+  const present = new Set(
+    Array.from(room.players.values()).map(p => p.color).filter(Boolean)
+  );
+  const order = getDefaultTurnOrder().filter(c => present.has(c));
+  return order.length ? order : ["red", "blue"];
 }
-function isColorConnected(room, color){
-  for (const p of room.players.values()){
-    if (p.color === color && isConnectedPlayer(p)) return true;
-  }
-  return false;
+
+function nextColorInOrder(order, current) {
+  const idx = order.indexOf(current);
+  if (idx === -1) return order[0];
+  return order[(idx + 1) % order.length];
 }
-function nextTurnColor(room, current){
-  const colors = activeColorsOf(room);
-  if (!colors.length) return current || "red";
-  const startIdx = Math.max(0, colors.indexOf(current));
-  for (let step=1; step<=colors.length; step++){
-    const cand = colors[(startIdx + step) % colors.length];
-    if (isColorConnected(room, cand)) return cand;
-  }
-  // fallback: if none connected, keep current
-  return current || colors[0];
+
+function nextTurnColor(room, current) {
+  const order = room?.state?.turnOrder || computeTurnOrderFromRoom(room);
+  return nextColorInOrder(order, current);
 }
 
 function getPiece(room, pieceId) {
@@ -804,7 +791,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       room.state = null;
       room.lastRollWasSix = false;
-      room.carryingByColor = { red: false, blue: false };
+      room.carryingByColor = { red: false, blue: false, green: false };
       // Farben NICHT neu zufaellig zuweisen:
       // Neuer Standard: Spieler waehlen ihre Farbe selbst in der Lobby.
       // (Reconnect/Token bleibt damit konsistent.)
