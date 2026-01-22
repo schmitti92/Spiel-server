@@ -673,7 +673,7 @@ for (const p of Array.from(room.players.values())) {
 {
   const connectedCount = Array.from(room.players.values()).filter(p => isConnectedPlayer(p)).length;
   if (!existing && connectedCount >= ALLOWED_COLORS.length) {
-    send(clientId, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
+    send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
     return;
   }
 }
