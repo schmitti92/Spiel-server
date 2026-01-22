@@ -12,9 +12,11 @@ const PORT = process.env.PORT || 10000;
 // Jeder (auch Host) wählt seine Farbe aktiv in der Lobby.
 // Reconnect via sessionToken behält die Farbe.
 //
-// 2–4 Spieler: alle 4 Farben sind grundsätzlich möglich.
-// Die Turn-Reihenfolge läuft über room.state.activeColors (nur die tatsächlich
-// im Match verwendeten Farben). Pieces existieren aber immer für alle 4 Farben.
+// AKTUELLER STAND: Der server-authoritative Turn-Flow ist derzeit auf 2 Farben
+// (red/blue) ausgelegt. Grün/Gelb sind im Client sichtbar, aber serverseitig
+// noch nicht als Spiel-Farben aktiv.
+// -> Sobald wir 3/4 Spieler aktivieren, erweitern wir hier ALLOWED_COLORS und
+//    passen Turn-Reihenfolge + Regeln additiv an.
 const ALLOWED_COLORS = ["red", "blue", "green", "yellow"];
 
 function roomUpdatePayload(room, playersOverride) {
@@ -138,14 +140,8 @@ async function restoreRoomState(room){
         room.state = data.state;
         // Backward-compat + safety defaults
         if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
-          room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
-        } else {
-          // Backward-compat: fehlende Farben auffüllen
-          for (const c of ALLOWED_COLORS) {
-            if (typeof room.state.carryingByColor[c] !== "boolean") room.state.carryingByColor[c] = false;
-          }
+          room.state.carryingByColor = { red: false, blue: false };
         }
-        if (!Array.isArray(room.state.activeColors)) room.state.activeColors = [];
         room.carryingByColor = room.state.carryingByColor;
         return true;
       }
@@ -163,13 +159,8 @@ async function restoreRoomState(room){
     if(payload && payload.state && typeof payload.state === "object"){
       room.state = payload.state;
       if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
-        room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
-      } else {
-        for (const c of ALLOWED_COLORS) {
-          if (typeof room.state.carryingByColor[c] !== "boolean") room.state.carryingByColor[c] = false;
-        }
+        room.state.carryingByColor = { red: false, blue: false };
       }
-      if (!Array.isArray(room.state.activeColors)) room.state.activeColors = [];
       room.carryingByColor = room.state.carryingByColor;
       return true;
     }
@@ -258,7 +249,7 @@ function makeRoom(code) {
     lastRollWasSix: false,
     // Backward-compat field. Source of truth is room.state.carryingByColor
     // because only room.state is persisted to disk/Firebase.
-    carryingByColor: { red: false, blue: false, green: false, yellow: false },
+    carryingByColor: { red: false, blue: false },
   };
 }
 
@@ -330,22 +321,34 @@ function assignColorsRandom(room) {
   const connected = Array.from(room.players.values()).filter(p => isConnectedPlayer(p));
   for (const p of connected) p.color = null;
   if (connected.length === 0) return;
-  if (connected.length > ALLOWED_COLORS.length) connected.length = ALLOWED_COLORS.length;
+  if (connected.length > 2) connected.length = 2;
 
-  // Zufällig verteilen, aber eindeutig
   shuffleInPlace(connected);
-  const colors = [...ALLOWED_COLORS];
-  shuffleInPlace(colors);
-  for (let i = 0; i < connected.length; i++) {
-    connected[i].color = colors[i];
-  }
+  const first = connected[0];
+  const second = connected[1] || null;
+  const firstColor = (Math.random() < 0.5) ? "red" : "blue";
+  first.color = firstColor;
+  if (second) second.color = (firstColor === "red") ? "blue" : "red";
 }
 
 /** ---------- Game state ---------- **/
 function initGameState(room) {
-  // pieces 5 per color in house
+  const ALL_COLORS = ["red","blue","green","yellow"];
+
+  // Active (spielbar) colors are only the colors of CONNECTED players who picked a color.
+  // This keeps 2–4 players possible, while ALL 4 colors remain visible in the houses.
+  const activeColors = Array.from(room.players.values())
+    .filter(p => p.color && isConnectedPlayer(p) && ALL_COLORS.includes(p.color))
+    .map(p => p.color);
+
+  // fallback safety
+  const uniq = [];
+  for(const c of activeColors){ if(!uniq.includes(c)) uniq.push(c); }
+  const playersTurn = (uniq.length >= 2) ? uniq : ["red","blue"];
+
+  // pieces 5 per color in house (ALL colors for visibility)
   const pieces = [];
-  for (const color of ["red", "blue"]) {
+  for (const color of ALL_COLORS) {
     const houses = (BOARD.nodes || [])
       .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
       .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
@@ -367,19 +370,11 @@ function initGameState(room) {
     .filter(n => n.kind === "board" && n.flags?.run)
     .map(n => n.id);
 
-  // activeColors = die Farben, die beim Spielstart tatsächlich mitspielen
-  // (2–4). Falls nicht angegeben, aus den verbundenen Spielern ableiten.
-  const act = Array.isArray(activeColors) && activeColors.length
-    ? activeColors.filter(c => ALLOWED_COLORS.includes(c))
-    : ALLOWED_COLORS.filter(c => Array.from(room.players.values()).some(p => isConnectedPlayer(p) && p.color === c));
-
-  // Fallback: mindestens 2 Farben erzwingen (damit Turn-Cycle nicht kaputt geht)
-  const active = (act.length >= 2) ? act : ALLOWED_COLORS.slice(0, 2);
-
-  // choose starter (deterministic-ish: first active color)
-  const turnColor = active[0] || "red";
+  // choose starter among ACTIVE colors
+  const turnColor = playersTurn[Math.floor(Math.random() * playersTurn.length)];
 
   room.lastRollWasSix = false;
+
   // IMPORTANT: carrying must survive restart -> store in room.state (persisted)
   const carryingByColor = { red: false, blue: false, green: false, yellow: false };
   room.carryingByColor = carryingByColor; // backward-compat alias
@@ -387,6 +382,7 @@ function initGameState(room) {
   room.state = {
     started: true,
     paused: false,
+    players: playersTurn,        // turn order list (2–4)
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -394,17 +390,13 @@ function initGameState(room) {
     barricades,
     goal: GOAL,
     carryingByColor,
-    activeColors: active,
   };
 }
 
-function nextTurnColor(room, current) {
-  const act = Array.isArray(room.state?.activeColors) && room.state.activeColors.length
-    ? room.state.activeColors
-    : ALLOWED_COLORS;
-  const i = act.indexOf(current);
-  if (i < 0) return act[0] || "red";
-  return act[(i + 1) % act.length];
+function nextTurnColor(room, current){
+  const order = Array.isArray(room?.state?.players) ? room.state.players : ["red","blue"];
+  const idx = order.indexOf(current);
+  return order[(idx + 1) % order.length] || order[0] || "red";
 }
 function getPiece(room, pieceId) {
   return room.state?.pieces?.find(p => p.id === pieceId) || null;
@@ -659,15 +651,6 @@ for (const p of Array.from(room.players.values())) {
   }
 }
 
-// Max 4 gleichzeitig verbundene Spieler pro Raum
-{
-  const connectedCount = Array.from(room.players.values()).filter(p => isConnectedPlayer(p)).length;
-  if (!existing && connectedCount >= ALLOWED_COLORS.length) {
-    send(clientId, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
-    return;
-  }
-}
-
 // If not reconnecting, honor requestedColor ONLY if free
 if (!color) {
   const usedNow = new Set(Array.from(room.players.values()).map(p => p.color).filter(Boolean));
@@ -788,17 +771,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann starten" }); return; }
       if (!canStart(room)) { send(ws, { type: "error", code: "NEED_2P", message: "Mindestens 2 Spieler nötig" }); return; }
 
-      // aktive Farben anhand verbundener Spieler (mit gewählter Farbe)
-      const act = Array.from(room.players.values())
-        .filter(p => isConnectedPlayer(p) && ALLOWED_COLORS.includes(p.color))
-        .map(p => p.color);
-      const uniqueAct = ALLOWED_COLORS.filter(c => act.includes(c));
-      if (uniqueAct.length < 2) {
-        send(ws, { type: "error", code: "NEED_COLORS", message: "Mindestens 2 Spieler müssen eine Farbe wählen" });
-        return;
-      }
-
-      initGameState(room, uniqueAct);
+      initGameState(room);
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
@@ -814,7 +787,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       room.state = null;
       room.lastRollWasSix = false;
-      room.carryingByColor = { red: false, blue: false, green: false, yellow: false };
+      room.carryingByColor = { red: false, blue: false };
       // Farben NICHT neu zufaellig zuweisen:
       // Neuer Standard: Spieler waehlen ihre Farbe selbst in der Lobby.
       // (Reconnect/Token bleibt damit konsistent.)
@@ -1002,7 +975,7 @@ if (msg.type === "move_request") {
         picked = true;
         // Persist the "carrying" flag inside state (so it survives restart)
         if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
-  room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
+          room.state.carryingByColor = { red: false, blue: false };
         }
         room.state.carryingByColor[pc.color] = true;
         room.carryingByColor = room.state.carryingByColor; // compat alias
@@ -1059,7 +1032,7 @@ if (msg.type === "place_barricade") {
 
   // carrying flag is persisted in room.state
   if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
-    room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
+    room.state.carryingByColor = { red: false, blue: false };
   }
   room.carryingByColor = room.state.carryingByColor; // compat alias
 
