@@ -342,7 +342,26 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-function initGameState(room) {
+function initGameState(room, activeColors) {
+  // Normalize activeColors (colors that are actually participating in turn order).
+  activeColors = Array.isArray(activeColors) && activeColors.length
+    ? activeColors.map(c => String(c).toLowerCase())
+    : null;
+
+  if (!activeColors) {
+    const fromState = room?.state?.activeColors;
+    if (Array.isArray(fromState) && fromState.length) {
+      activeColors = fromState.map(c => String(c).toLowerCase());
+    }
+  }
+
+  if (!activeColors) {
+    // Fallback: connected players with a chosen color, in stable order.
+    const order = ["red","blue","green","yellow"];
+    activeColors = order.filter(col => room.players && [...room.players.values()].some(p => p && p.color === col));
+    if (!activeColors.length) activeColors = ["red","blue"]; // last-resort fallback
+  }
+
   // pieces 5 per color in house
   const pieces = [];
   for (const color of ["red", "blue"]) {
@@ -673,7 +692,7 @@ for (const p of Array.from(room.players.values())) {
 {
   const connectedCount = Array.from(room.players.values()).filter(p => isConnectedPlayer(p)).length;
   if (!existing && connectedCount >= ALLOWED_COLORS.length) {
-    send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
+    send(clientId, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
     return;
   }
 }
