@@ -363,8 +363,10 @@ function initGameState(room, activeColors) {
   }
 
   // pieces 5 per color in house
+  // WICHTIG: Für 2–4 Spieler müssen alle 4 Farben echte Pieces im Server-State haben,
+  // sonst kann z.B. Grün zwar würfeln, aber keine Figur auswählen/bewegen.
   const pieces = [];
-  for (const color of ["red", "blue"]) {
+  for (const color of ALLOWED_COLORS) {
     const houses = (BOARD.nodes || [])
       .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
       .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
