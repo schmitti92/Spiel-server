@@ -127,9 +127,6 @@ async function persistRoomState(room){
 }
 
 async function restoreRoomState(room){
-  // Ensure runtime maps exist (not persisted)
-  if (room && !room.clients) room.clients = new Map();
-  if (room && !room.players) room.players = new Map();
   // Prefer Firestore when enabled; otherwise disk.
   try{
     initFirebaseIfConfigured();
@@ -257,10 +254,8 @@ function makeRoom(code) {
     code,
     hostToken: null, // stable host identity (sessionToken)
     players: new Map(), // clientId -> {id,name,color,isHost,sessionToken,lastSeen}
-    clients: new Map(), // clientId -> ws (for duplicate-session + connected check)
     state: null,
     lastRollWasSix: false,
-    wheelTimer: null, // timer for Glücksrad-start
     // Backward-compat field. Source of truth is room.state.carryingByColor
     // because only room.state is persisted to disk/Firebase.
     carryingByColor: { red: false, blue: false, green: false, yellow: false },
@@ -368,8 +363,10 @@ function initGameState(room, activeColors) {
   }
 
   // pieces 5 per color in house
+  // WICHTIG: Für 2–4 Spieler müssen alle 4 Farben echte Pieces im Server-State haben,
+  // sonst kann z.B. Grün zwar würfeln, aber keine Figur auswählen/bewegen.
   const pieces = [];
-  for (const color of ["red", "blue"]) {
+  for (const color of ALLOWED_COLORS) {
     const houses = (BOARD.nodes || [])
       .filter(n => n.kind === "house" && String(n.flags?.houseColor || "").toLowerCase() === color)
       .sort((a, b) => (a.flags?.houseSlot ?? 0) - (b.flags?.houseSlot ?? 0));
@@ -610,7 +607,6 @@ wss.on("connection", (ws) => {
         const old = rooms.get(c.room);
         if (old) {
           old.players.delete(clientId);
-          if (old.clients) old.clients.delete(clientId);
           broadcast(old, roomUpdatePayload(old));
         }
       }
@@ -618,9 +614,6 @@ wss.on("connection", (ws) => {
       // get/create room
       let room = rooms.get(roomCode);
       if (!room) { room = makeRoom(roomCode); rooms.set(roomCode, room); }
-      // Ensure runtime maps exist (not persisted)
-      if (!room.clients) room.clients = new Map();
-      if (!room.players) room.players = new Map();
 
       // If server restarted / room.state missing, try to restore from disk (best-effort)
       if (!room.state) {
@@ -640,14 +633,13 @@ wss.on("connection", (ws) => {
       if (existing) {
         // Prevent a NEW client from kicking a currently-connected player that uses the same sessionToken.
         // If the old one is truly disconnected, reconnect still works (old ws not in room.clients).
-        const existingWs = (room.clients ? room.clients.get(existing.id) : null);
+        const existingWs = room.clients.get(existing.id);
         if (existingWs && existingWs.readyState === 1 && existing.id !== clientId) {
           safeSend(ws, { t: "error", code: "DUPLICATE_SESSION", message: "Diese Sitzung ist bereits verbunden (Session bereits aktiv)." });
           try { ws.close(4000, "DUPLICATE_SESSION"); } catch (_) {}
           return;
         }
         room.players.delete(existing.id);
-        if (room.clients) room.clients.delete(existing.id);
       }
       const existingColor = existing?.color || null;
 
@@ -722,9 +714,6 @@ if (!color) {
 room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, lastSeen: Date.now() });
       // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
       c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
-      // Track active websocket per clientId inside room (runtime only)
-      if (!room.clients) room.clients = new Map();
-      room.clients.set(clientId, ws);
 
       // Reconnect-Sicherheit: Wenn noch nicht wieder 2 Spieler verbunden sind,
       // pausieren wir den Raum sofort (auch nach Server-Restart/Restore).
@@ -751,7 +740,6 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
     if (msg.type === "leave") {
       room.players.delete(clientId);
-      if (room.clients) room.clients.delete(clientId);
       c.room = null;
       send(ws, roomUpdatePayload(room, []));
       broadcast(room, roomUpdatePayload(room));
@@ -841,47 +829,10 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-            // Glücksrad-Start: Server bestimmt fair den Starter, pausiert 10s, danach geht's los.
       initGameState(room, uniqueAct);
-
-      const starter = uniqueAct[Math.floor(Math.random() * uniqueAct.length)];
-      room.state.turnColor = starter;
-
-      // während des Glücksrads darf niemand würfeln/ziehen
-      const durationMs = 10000;
-      room.state.paused = true;
-      room.state.phase = "starting";
-      room.state.wheel = {
-        starterColor: starter,
-        activeColors: uniqueAct,
-        endsAt: Date.now() + durationMs
-      };
-
       await persistRoomState(room);
-      console.log(`[start] room=${room.code} wheel starter=${starter} (in ${durationMs}ms)`);
-
+      console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
-
-      // Timer pro Raum (wenn erneut gestartet wird, alten Timer löschen)
-      try {
-        if (room.wheelTimer) clearTimeout(room.wheelTimer);
-      } catch(_e) {}
-      room.wheelTimer = setTimeout(async () => {
-        try {
-          if (!room.state || !room.state.wheel) return;
-          // Wheel fertig -> Spiel freigeben
-          room.state.paused = false;
-          room.state.phase = "need_roll";
-          delete room.state.wheel;
-
-          await persistRoomState(room);
-          broadcast(room, { type: "wheel_done", state: room.state });
-          broadcast(room, roomUpdatePayload(room));
-        } catch(e) {
-          console.log("[wheel_done] error", e);
-        }
-      }, durationMs);
-
       return;
     }
 
@@ -1237,7 +1188,6 @@ if (msg.type === "place_barricade") {
     if (roomCode) {
       const room = rooms.get(roomCode);
       if (room) {
-        if (room.clients) room.clients.delete(clientId);
         const p = room.players.get(clientId);
         const wasColor = p?.color;
         const wasTurn = room.state?.turnColor;
