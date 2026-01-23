@@ -260,6 +260,7 @@ function makeRoom(code) {
     clients: new Map(), // clientId -> ws (for duplicate-session + connected check)
     state: null,
     lastRollWasSix: false,
+    wheelTimer: null, // timer for Glücksrad-start
     // Backward-compat field. Source of truth is room.state.carryingByColor
     // because only room.state is persisted to disk/Firebase.
     carryingByColor: { red: false, blue: false, green: false, yellow: false },
@@ -840,10 +841,47 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
+            // Glücksrad-Start: Server bestimmt fair den Starter, pausiert 10s, danach geht's los.
       initGameState(room, uniqueAct);
+
+      const starter = uniqueAct[Math.floor(Math.random() * uniqueAct.length)];
+      room.state.turnColor = starter;
+
+      // während des Glücksrads darf niemand würfeln/ziehen
+      const durationMs = 10000;
+      room.state.paused = true;
+      room.state.phase = "starting";
+      room.state.wheel = {
+        starterColor: starter,
+        activeColors: uniqueAct,
+        endsAt: Date.now() + durationMs
+      };
+
       await persistRoomState(room);
-      console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
+      console.log(`[start] room=${room.code} wheel starter=${starter} (in ${durationMs}ms)`);
+
       broadcast(room, { type: "started", state: room.state });
+
+      // Timer pro Raum (wenn erneut gestartet wird, alten Timer löschen)
+      try {
+        if (room.wheelTimer) clearTimeout(room.wheelTimer);
+      } catch(_e) {}
+      room.wheelTimer = setTimeout(async () => {
+        try {
+          if (!room.state || !room.state.wheel) return;
+          // Wheel fertig -> Spiel freigeben
+          room.state.paused = false;
+          room.state.phase = "need_roll";
+          delete room.state.wheel;
+
+          await persistRoomState(room);
+          broadcast(room, { type: "wheel_done", state: room.state });
+          broadcast(room, roomUpdatePayload(room));
+        } catch(e) {
+          console.log("[wheel_done] error", e);
+        }
+      }, durationMs);
+
       return;
     }
 
