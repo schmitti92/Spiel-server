@@ -342,7 +342,7 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-function initGameState(room, activeColors) {
+function initGameState(room, activeColors, starterColor) {
   // Normalize activeColors (colors that are actually participating in turn order).
   activeColors = Array.isArray(activeColors) && activeColors.length
     ? activeColors.map(c => String(c).toLowerCase())
@@ -398,7 +398,8 @@ function initGameState(room, activeColors) {
   const active = (act.length >= 2) ? act : ALLOWED_COLORS.slice(0, 2);
 
   // choose starter (deterministic-ish: first active color)
-  const turnColor = active[0] || "red";
+  const wanted = String(starterColor||"").toLowerCase();
+  const turnColor = (wanted && active.includes(wanted)) ? wanted : (active[0] || "red");
 
   room.lastRollWasSix = false;
   // IMPORTANT: carrying must survive restart -> store in room.state (persisted)
@@ -416,6 +417,7 @@ function initGameState(room, activeColors) {
     goal: GOAL,
     carryingByColor,
     activeColors: active,
+    startWheel: { starterColor: turnColor, at: Date.now(), durationMs: 10000 },
   };
 }
 
@@ -829,7 +831,8 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      initGameState(room, uniqueAct);
+      const starterColor = uniqueAct[Math.floor(Math.random()*uniqueAct.length)];
+      initGameState(room, uniqueAct, starterColor);
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
