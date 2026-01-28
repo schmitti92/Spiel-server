@@ -633,9 +633,10 @@ wss.on("connection", (ws) => {
       if (existing) {
         // Prevent a NEW client from kicking a currently-connected player that uses the same sessionToken.
         // If the old one is truly disconnected, reconnect still works (old ws not in room.clients).
-        const existingWs = room.clients.get(existing.id);
+        const existingClient = clients.get(existing.id);
+        const existingWs = existingClient?.ws;
         if (existingWs && existingWs.readyState === 1 && existing.id !== clientId) {
-          safeSend(ws, { t: "error", code: "DUPLICATE_SESSION", message: "Diese Sitzung ist bereits verbunden (Session bereits aktiv)." });
+          send(ws, { type: "error", code: "DUPLICATE_SESSION", message: "Diese Sitzung ist bereits verbunden (Session bereits aktiv)." });
           try { ws.close(4000, "DUPLICATE_SESSION"); } catch (_) {}
           return;
         }
@@ -694,7 +695,8 @@ for (const p of Array.from(room.players.values())) {
 {
   const connectedCount = Array.from(room.players.values()).filter(p => isConnectedPlayer(p)).length;
   if (!existing && connectedCount >= ALLOWED_COLORS.length) {
-    send(clientId, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
+    send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
+    try { ws.close(4001, "ROOM_FULL"); } catch (_) {}
     return;
   }
 }
