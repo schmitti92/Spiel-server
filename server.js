@@ -253,7 +253,6 @@ function makeRoom(code) {
   return {
     code,
     hostToken: null, // stable host identity (sessionToken)
-    clients: new Map(), // clientId -> ws (for reconnect + duplicate session protection)
     players: new Map(), // clientId -> {id,name,color,isHost,sessionToken,lastSeen}
     state: null,
     lastRollWasSix: false,
@@ -323,16 +322,6 @@ function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (_e) {}
 }
 
-function safeSend(ws, payload) {
-  try {
-    if (!ws) return;
-    if (ws.readyState !== 1) return; // WebSocket.OPEN
-    if (typeof payload === "string") ws.send(payload);
-    else ws.send(JSON.stringify(payload));
-  } catch (_e) {}
-}
-
-
 function assignColorsRandom(room) {
   // remove offline placeholders on reset
   for (const p of Array.from(room.players.values())) {
@@ -353,7 +342,7 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-function initGameState(room, activeColors) {
+function initGameState(room, activeColors, mode) {
   // Normalize activeColors (colors that are actually participating in turn order).
   activeColors = Array.isArray(activeColors) && activeColors.length
     ? activeColors.map(c => String(c).toLowerCase())
@@ -419,6 +408,7 @@ function initGameState(room, activeColors) {
   room.state = {
     started: true,
     paused: false,
+    mode: (typeof mode === "string" ? mode : "classic"),
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -427,6 +417,19 @@ function initGameState(room, activeColors) {
     goal: GOAL,
     carryingByColor,
     activeColors: active,
+    // Action-Modus: Joker-State vorbereiten (ohne Effekte, ohne UI-Zwang)
+    // Server bleibt Chef. Client darf nur "use_joker" etc. anfragen (kommt später).
+    action: (String((typeof mode === "string" ? mode : "classic")).toLowerCase() === "action") ? {
+      enabled: true,
+      // pro Farbe (nur aktive Farben bekommen Joker = true)
+      jokersByColor: Object.fromEntries(ALLOWED_COLORS.map(c => [c, {
+        choose: active.includes(c),
+        sum: active.includes(c),
+        allColors: active.includes(c),
+        barricade: active.includes(c),
+      }])),
+      effects: {},
+    } : null,
   };
 }
 
@@ -618,7 +621,6 @@ wss.on("connection", (ws) => {
         const old = rooms.get(c.room);
         if (old) {
           old.players.delete(clientId);
-          if (old.clients) old.clients.delete(clientId);
           broadcast(old, roomUpdatePayload(old));
         }
       }
@@ -652,7 +654,6 @@ wss.on("connection", (ws) => {
           return;
         }
         room.players.delete(existing.id);
-        if (room.clients) room.clients.delete(existing.id);
       }
       const existingColor = existing?.color || null;
 
@@ -707,7 +708,7 @@ for (const p of Array.from(room.players.values())) {
 {
   const connectedCount = Array.from(room.players.values()).filter(p => isConnectedPlayer(p)).length;
   if (!existing && connectedCount >= ALLOWED_COLORS.length) {
-    send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
+    send(clientId, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
     return;
   }
 }
@@ -725,7 +726,6 @@ if (!color) {
 }
 
 room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, lastSeen: Date.now() });
-      room.clients.set(clientId, ws);
       // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
       c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
 
@@ -754,7 +754,6 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
     if (msg.type === "leave") {
       room.players.delete(clientId);
-      if (room.clients) room.clients.delete(clientId);
       c.room = null;
       send(ws, roomUpdatePayload(room, []));
       broadcast(room, roomUpdatePayload(room));
@@ -844,7 +843,8 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      initGameState(room, uniqueAct);
+            const mode = (typeof msg.mode === "string" ? msg.mode : "classic");
+      initGameState(room, uniqueAct, mode);
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
