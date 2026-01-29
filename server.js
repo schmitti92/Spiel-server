@@ -1231,4 +1231,28 @@ if (msg.type === "place_barricade") {
   });
 });
 
+
+
+// ---------- Snapshot Heartbeat (Server is Chef) ----------
+// Sends the current authoritative snapshot periodically so clients can resync after
+// Render sleep/reconnect/message-loss without any risky auto-repair.
+// Safe: does NOT change game state, only broadcasts existing room.state.
+const SNAPSHOT_HEARTBEAT_MS = Number(process.env.SNAPSHOT_HEARTBEAT_MS || 3000);
+
+setInterval(() => {
+  try {
+    for (const room of rooms.values()) {
+      if (!room || !room.state || !room.state.started) continue;
+
+      // only if at least one connected player is present
+      const hasConnected = Array.from(room.players.values()).some(p => isConnectedPlayer(p));
+      if (!hasConnected) continue;
+
+      broadcast(room, { type: "snapshot", state: room.state, hb: true, ts: Date.now() });
+    }
+  } catch (_e) {
+    // never crash the server because of heartbeat
+  }
+}, SNAPSHOT_HEARTBEAT_MS);
+
 server.listen(PORT, () => console.log("Barikade server listening on", PORT));
