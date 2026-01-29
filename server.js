@@ -17,23 +17,6 @@ const PORT = process.env.PORT || 10000;
 // im Match verwendeten Farben). Pieces existieren aber immer für alle 4 Farben.
 const ALLOWED_COLORS = ["red", "blue", "green", "yellow"];
 
-
-// ---------- Safe WebSocket Send (prevents server crash) ----------
-// Some clients may disconnect mid-send. We NEVER want that to crash the server.
-// Returns true if sent, false if skipped/failed.
-function safeSend(ws, payload) {
-  try {
-    if (!ws) return false;
-    if (ws.readyState !== 1) return false; // 1 = OPEN
-    const data = typeof payload === "string" ? payload : JSON.stringify(payload);
-    ws.send(data);
-    return true;
-  } catch (err) {
-    console.warn("[safeSend] send failed:", (err && err.message) ? err.message : err);
-    return false;
-  }
-}
-
 function roomUpdatePayload(room, playersOverride) {
   return {
     type: "room_update",
@@ -270,6 +253,7 @@ function makeRoom(code) {
   return {
     code,
     hostToken: null, // stable host identity (sessionToken)
+    clients: new Map(), // clientId -> ws (for reconnect + duplicate session protection)
     players: new Map(), // clientId -> {id,name,color,isHost,sessionToken,lastSeen}
     state: null,
     lastRollWasSix: false,
@@ -338,6 +322,16 @@ function broadcast(room, obj) {
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (_e) {}
 }
+
+function safeSend(ws, payload) {
+  try {
+    if (!ws) return;
+    if (ws.readyState !== 1) return; // WebSocket.OPEN
+    if (typeof payload === "string") ws.send(payload);
+    else ws.send(JSON.stringify(payload));
+  } catch (_e) {}
+}
+
 
 function assignColorsRandom(room) {
   // remove offline placeholders on reset
@@ -624,6 +618,7 @@ wss.on("connection", (ws) => {
         const old = rooms.get(c.room);
         if (old) {
           old.players.delete(clientId);
+          if (old.clients) old.clients.delete(clientId);
           broadcast(old, roomUpdatePayload(old));
         }
       }
@@ -657,6 +652,7 @@ wss.on("connection", (ws) => {
           return;
         }
         room.players.delete(existing.id);
+        if (room.clients) room.clients.delete(existing.id);
       }
       const existingColor = existing?.color || null;
 
@@ -711,7 +707,7 @@ for (const p of Array.from(room.players.values())) {
 {
   const connectedCount = Array.from(room.players.values()).filter(p => isConnectedPlayer(p)).length;
   if (!existing && connectedCount >= ALLOWED_COLORS.length) {
-    send(clientId, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
+    send(ws, { type: "error", code: "ROOM_FULL", message: `Raum ist voll (max ${ALLOWED_COLORS.length} Spieler).` });
     return;
   }
 }
@@ -729,6 +725,7 @@ if (!color) {
 }
 
 room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, lastSeen: Date.now() });
+      room.clients.set(clientId, ws);
       // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
       c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
 
@@ -757,6 +754,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
     if (msg.type === "leave") {
       room.players.delete(clientId);
+      if (room.clients) room.clients.delete(clientId);
       c.room = null;
       send(ws, roomUpdatePayload(room, []));
       broadcast(room, roomUpdatePayload(room));
