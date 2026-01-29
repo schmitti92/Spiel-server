@@ -352,7 +352,7 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-function initGameState(room, activeColors) {
+function initGameState(room, activeColors, mode = "classic") {
   // Normalize activeColors (colors that are actually participating in turn order).
   activeColors = Array.isArray(activeColors) && activeColors.length
     ? activeColors.map(c => String(c).toLowerCase())
@@ -415,9 +415,34 @@ function initGameState(room, activeColors) {
   const carryingByColor = { red: false, blue: false, green: false, yellow: false };
   room.carryingByColor = carryingByColor; // backward-compat alias
 
+  // ===== Mode / Action-Mode Jokers (server is chef) =====
+  const gameMode = (String(mode || "classic").toLowerCase() === "action") ? "action" : "classic";
+
+  // Action state lives fully on the server (persisted in room.state).
+  // Client UI only reads this snapshot.
+  const action = (gameMode === "action") ? {
+    // Per color: each joker can be used exactly once per game
+    jokersByColor: {
+      red:      { choose: true, sum: true, allColors: true, barricade: true },
+      blue:     { choose: true, sum: true, allColors: true, barricade: true },
+      green:    { choose: true, sum: true, allColors: true, barricade: true },
+      yellow:   { choose: true, sum: true, allColors: true, barricade: true },
+    },
+    // Active effects for the CURRENT turn only (cleared on end_turn)
+    effects: {
+      allColorsBy: null,   // color that may move any piece this turn
+      barricadeBy: null,   // color that may move one barricade this turn
+      doubleRoll: null,    // {kind:"choose"|"sum", by:"red", rolls:[..], chosen?:n }
+    },
+    // version for future-proofing (optional)
+    v: 1,
+  } : null;
+
   room.state = {
     started: true,
     paused: false,
+    mode: gameMode,
+    action,
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -841,7 +866,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      initGameState(room, uniqueAct);
+      initGameState(room, uniqueAct, msg.mode || "classic");
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
@@ -886,7 +911,98 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       await persistRoomState(room);
       broadcast(room, { type: "snapshot", state: room.state });
       return;
+    }    // ---------- ACTION MODE: JOKERS (server is chef) ----------
+    // Safety-first rollout:
+    // - allColors + barricade are enabled (low risk)
+    // - choose + sum are reserved for next step (needs dice UI for 7-12 etc.)
+    if (msg.type === "use_joker") {
+      if (!requireRoomState(room, ws)) return;
+      if (!requireTurn(room, clientId, ws)) return;
+
+      if (String(room.state.mode || "classic") !== "action" || !room.state.action) {
+        send(ws, { type: "error", code: "NOT_ACTION", message: "Action-Modus ist nicht aktiv" });
+        return;
+      }
+
+      const turnColor = room.state.turnColor;
+      const set = room.state.action.jokersByColor?.[turnColor];
+      if (!set) { send(ws, { type: "error", code: "NO_JOKERS", message: "Joker-Set fehlt" }); return; }
+
+      const joker = String(msg.joker || "").toLowerCase().trim();
+
+      // helper: mark used
+      const markUsed = (k) => { if (set && set[k] === true) set[k] = false; };
+
+      if (joker === "allcolors") {
+        if (set.allColors !== true) { send(ws, { type: "error", code: "USED", message: "Alle Farben Joker schon verbraucht" }); return; }
+        room.state.action.effects.allColorsBy = turnColor;
+        markUsed("allColors");
+        await persistRoomState(room);
+        broadcast(room, { type: "snapshot", state: room.state, joker: "allcolors" });
+        return;
+      }
+
+      if (joker === "barricade") {
+        if (set.barricade !== true) { send(ws, { type: "error", code: "USED", message: "Barikade Joker schon verbraucht" }); return; }
+        room.state.action.effects.barricadeBy = turnColor;
+        markUsed("barricade");
+        await persistRoomState(room);
+        broadcast(room, { type: "snapshot", state: room.state, joker: "barricade" });
+        return;
+      }
+
+      if (joker === "choose" || joker === "sum") {
+        send(ws, { type: "error", code: "NOT_READY", message: "Choose/Summe kommt im nächsten Schritt (sonst Risiko mit Würfel-UI)" });
+        return;
+      }
+
+      send(ws, { type: "error", code: "BAD_JOKER", message: "Unbekannter Joker" });
+      return;
     }
+
+    if (msg.type === "action_barricade_move") {
+      if (!requireRoomState(room, ws)) return;
+      if (!requireTurn(room, clientId, ws)) return;
+
+      if (String(room.state.mode || "classic") !== "action" || !room.state.action) {
+        send(ws, { type: "error", code: "NOT_ACTION", message: "Action-Modus ist nicht aktiv" });
+        return;
+      }
+
+      const turnColor = room.state.turnColor;
+      const eff = room.state.action.effects || {};
+      if (eff.barricadeBy !== turnColor) {
+        send(ws, { type: "error", code: "NO_EFFECT", message: "Barikade-Effekt ist nicht aktiv" });
+        return;
+      }
+      if (room.state.phase !== "need_roll") {
+        send(ws, { type: "error", code: "BAD_PHASE", message: "Barikade-Joker nur vor dem Würfeln" });
+        return;
+      }
+
+      const from = String(msg.from || "");
+      const to   = String(msg.to || "");
+      if (!from || !to) { send(ws, { type: "error", code: "BAD_ARGS", message: "from/to fehlt" }); return; }
+      if (from === to) { send(ws, { type: "error", code: "BAD_ARGS", message: "Quelle = Ziel" }); return; }
+      if (to === String(room.state.goal)) { send(ws, { type: "error", code: "GOAL_BLOCKED", message: "Ziel-Feld ist gesperrt" }); return; }
+
+      const barr = room.state.barricades || [];
+      if (!barr.includes(from)) { send(ws, { type: "error", code: "NO_BARR", message: "Quelle hat keine Barikade" }); return; }
+      if (barr.includes(to)) { send(ws, { type: "error", code: "HAS_BARR", message: "Ziel hat schon eine Barikade" }); return; }
+
+      // move
+      room.state.barricades = barr.filter(x => x !== from);
+      room.state.barricades.push(to);
+
+      // effect is single-use per turn -> clear now
+      room.state.action.effects.barricadeBy = null;
+
+      await persistRoomState(room);
+      broadcast(room, { type: "snapshot", state: room.state, moved: { from, to } });
+      return;
+    }
+
+
 
     // ---------- ROLL ----------
     if (msg.type === "roll_request") {
@@ -919,6 +1035,15 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
+      // Action-Mode: clear per-turn effects when a turn ends (prevents desync / stuck effects)
+      if (String(room.state.mode || "classic") === "action" && room.state.action && room.state.action.effects) {
+        const ended = room.state.turnColor;
+        const eff = room.state.action.effects;
+        if (eff.allColorsBy === ended) eff.allColorsBy = null;
+        if (eff.barricadeBy === ended) eff.barricadeBy = null;
+        if (eff.doubleRoll && eff.doubleRoll.by === ended) eff.doubleRoll = null;
+      }
+
       room.lastRollWasSix = false;
       room.state.rolled = null;
       room.state.phase = "need_roll";
@@ -942,7 +1067,9 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       const pieceId = String(msg.pieceId || "");
       const pc = getPiece(room, pieceId);
-      if (!pc || pc.color !== room.state.turnColor) {
+      const allowAll = (String(room.state.mode || "classic") === "action") && room.state.action && room.state.action.effects && (room.state.action.effects.allColorsBy === room.state.turnColor);
+
+      if (!pc || (!allowAll && pc.color !== room.state.turnColor)) {
         send(ws, { type: "error", code: "BAD_PIECE", message: "Ungültige Figur" });
         return;
       }
