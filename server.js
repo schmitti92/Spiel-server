@@ -935,6 +935,11 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       if (joker === "allcolors") {
         if (set.allColors !== true) { send(ws, { type: "error", code: "USED", message: "Alle Farben Joker schon verbraucht" }); return; }
+        // Wunsch: Joker erst NACH dem Würfeln (Phase need_move)
+        if (room.state.phase !== "need_move" || room.state.rolled == null) {
+          send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Joker wählen" });
+          return;
+        }
         room.state.action.effects.allColorsBy = turnColor;
         markUsed("allColors");
         await persistRoomState(room);
@@ -1136,7 +1141,15 @@ if (msg.type === "move_request") {
       const targetId = String(msg.targetId || "");
       const pc = getPiece(room, pieceId);
 
-      if (!pc || pc.color !== room.state.turnColor) {
+      // Action‑Mode Joker "Alle Farben": aktiver Spieler bleibt turnColor,
+      // aber darf (einmalig) auch fremde Figuren bewegen.
+      const activeColor = room.state.turnColor;
+      const allowAll = (String(room.state.mode || "classic") === "action")
+        && room.state.action
+        && room.state.action.effects
+        && (room.state.action.effects.allColorsBy === activeColor);
+
+      if (!pc || (!allowAll && pc.color !== activeColor)) {
         send(ws, { type: "error", code: "BAD_PIECE", message: "Ungültige Figur" });
         return;
       }
@@ -1174,7 +1187,7 @@ if (msg.type === "move_request") {
         if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
   room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
         }
-        room.state.carryingByColor[pc.color] = true;
+        room.state.carryingByColor[activeColor] = true;
         room.carryingByColor = room.state.carryingByColor; // compat alias
         room.state.phase = "place_barricade";
       } else {
@@ -1184,15 +1197,22 @@ if (msg.type === "move_request") {
       // if no barricade placement needed:
       if (!picked) {
         if (room.lastRollWasSix) {
-          room.state.turnColor = pc.color; // extra roll
+          room.state.turnColor = activeColor; // extra roll (Joker-sicher)
         } else {
-          room.state.turnColor = nextTurnColor(room, pc.color);
+          room.state.turnColor = nextTurnColor(room, activeColor);
         }
         room.state.phase = "need_roll";
         room.state.rolled = null;
       }
 
-      console.log(`[move] room=${room.code} color=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
+      // Joker‑Effekt endet nach dem Zug (verhindert Turn‑Chaos)
+      if (String(room.state.mode || "classic") === "action" && room.state.action && room.state.action.effects) {
+        if (room.state.action.effects.allColorsBy === activeColor) {
+          room.state.action.effects.allColorsBy = null;
+        }
+      }
+
+      console.log(`[move] room=${room.code} active=${activeColor} moved=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
       broadcast(room, {
         type: "move",
         action: { pieceId: pc.id, path: res.path, pickedBarricade: picked, kickedPieces: kicked },
