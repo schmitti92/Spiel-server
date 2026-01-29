@@ -17,6 +17,23 @@ const PORT = process.env.PORT || 10000;
 // im Match verwendeten Farben). Pieces existieren aber immer für alle 4 Farben.
 const ALLOWED_COLORS = ["red", "blue", "green", "yellow"];
 
+
+// ---------- Safe WebSocket Send (prevents server crash) ----------
+// Some clients may disconnect mid-send. We NEVER want that to crash the server.
+// Returns true if sent, false if skipped/failed.
+function safeSend(ws, payload) {
+  try {
+    if (!ws) return false;
+    if (ws.readyState !== 1) return false; // 1 = OPEN
+    const data = typeof payload === "string" ? payload : JSON.stringify(payload);
+    ws.send(data);
+    return true;
+  } catch (err) {
+    console.warn("[safeSend] send failed:", (err && err.message) ? err.message : err);
+    return false;
+  }
+}
+
 function roomUpdatePayload(room, playersOverride) {
   return {
     type: "room_update",
@@ -342,42 +359,7 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-/** ---------- Action Mode (Jokers) ---------- **/
-function initJokersByColor(activeColors){
-  const out = {};
-  for(const c of ALLOWED_COLORS){
-    out[c] = (Array.isArray(activeColors) && activeColors.includes(c))
-      ? { choose:true, sum:true, allColors:true, barricade:true }
-      : null;
-  }
-  return out;
-}
-
-function isActionMode(room){
-  return !!(room && room.state && room.state.mode === "action" && room.state.action);
-}
-
-function canControlPieceInAction(room, actorColor, pieceColor){
-  if(pieceColor === actorColor) return true;
-  if(!isActionMode(room)) return false;
-  const eff = room.state.action?.effects;
-  return !!(eff && eff.allColorsBy === actorColor);
-}
-
-function consumeJoker(room, color, jokerKey){
-  if(!isActionMode(room)) return { ok:false, msg:"not action mode" };
-  const set = room.state.action?.jokersByColor?.[color];
-  if(!set || set[jokerKey] !== true) return { ok:false, msg:"joker not available" };
-  set[jokerKey] = false;
-  return { ok:true };
-}
-
-function clearTurnEffects(room){
-  if(!isActionMode(room)) return;
-  room.state.action.effects = { allColorsBy: null, doubleRoll: null, barricadeBy: null };
-}
-
-function initGameState(room, activeColors, opts = {}) {
+function initGameState(room, activeColors) {
   // Normalize activeColors (colors that are actually participating in turn order).
   activeColors = Array.isArray(activeColors) && activeColors.length
     ? activeColors.map(c => String(c).toLowerCase())
@@ -451,11 +433,6 @@ function initGameState(room, activeColors, opts = {}) {
     goal: GOAL,
     carryingByColor,
     activeColors: active,
-    mode: (opts && opts.mode==="action") ? "action" : "classic",
-    action: ((opts && opts.mode==="action") ? {
-      jokersByColor: initJokersByColor(active),
-      effects: { allColorsBy: null, doubleRoll: null, barricadeBy: null },
-    } : null),
   };
 }
 
@@ -673,7 +650,7 @@ wss.on("connection", (ws) => {
       if (existing) {
         // Prevent a NEW client from kicking a currently-connected player that uses the same sessionToken.
         // If the old one is truly disconnected, reconnect still works (old ws not in room.clients).
-        const existingWs = clients.get(existing.id)?.ws;
+        const existingWs = room.clients.get(existing.id);
         if (existingWs && existingWs.readyState === 1 && existing.id !== clientId) {
           safeSend(ws, { t: "error", code: "DUPLICATE_SESSION", message: "Diese Sitzung ist bereits verbunden (Session bereits aktiv)." });
           try { ws.close(4000, "DUPLICATE_SESSION"); } catch (_) {}
@@ -869,8 +846,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      const mode = (String(msg.mode||"").toLowerCase()==="action") ? "action" : "classic";
-      initGameState(room, uniqueAct, { mode });
+      initGameState(room, uniqueAct);
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
@@ -917,135 +893,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       return;
     }
 
-    
-// ---------- ACTION MODE: USE JOKER ----------
-if (msg.type === "use_joker") {
-  if (!requireRoomState(room, ws)) return;
-  if (!requireTurn(room, clientId, ws)) return;
-  if (!isActionMode(room)) { send(ws, { type:"error", code:"NOT_ACTION", message:"Action-Modus ist nicht aktiv" }); return; }
-
-  const joker = String(msg.joker||"").toLowerCase().trim();
-  const color = room.state.turnColor;
-
-  if ((joker==="choose" || joker==="sum" || joker==="barricade") && room.state.phase !== "need_roll") {
-    send(ws, { type:"error", code:"BAD_PHASE", message:"Joker jetzt nicht möglich" });
-    return;
-  }
-  if (joker==="allcolors" && !(room.state.phase==="need_roll" || room.state.phase==="need_move")) {
-    send(ws, { type:"error", code:"BAD_PHASE", message:"Joker jetzt nicht möglich" });
-    return;
-  }
-
-  if (joker === "choose") {
-    const r = consumeJoker(room, color, "choose");
-    if(!r.ok){ send(ws,{type:"error", code:"NO_JOKER", message:"Choose-Joker nicht verfügbar"}); return; }
-    room.state.action.effects.doubleRoll = { kind:"choose", by: color, rolls: [] };
-    await persistRoomState(room);
-    broadcast(room, { type:"snapshot", state: room.state, players: currentPlayersList(room) });
-    return;
-  }
-
-  if (joker === "sum") {
-    const r = consumeJoker(room, color, "sum");
-    if(!r.ok){ send(ws,{type:"error", code:"NO_JOKER", message:"Summe-Joker nicht verfügbar"}); return; }
-    room.state.action.effects.doubleRoll = { kind:"sum", by: color, rolls: [] };
-    await persistRoomState(room);
-    broadcast(room, { type:"snapshot", state: room.state, players: currentPlayersList(room) });
-    return;
-  }
-
-  if (joker === "allcolors") {
-    const r = consumeJoker(room, color, "allColors");
-    if(!r.ok){ send(ws,{type:"error", code:"NO_JOKER", message:"Alle-Farben-Joker nicht verfügbar"}); return; }
-    room.state.action.effects.allColorsBy = color;
-    await persistRoomState(room);
-    broadcast(room, { type:"snapshot", state: room.state, players: currentPlayersList(room) });
-    return;
-  }
-
-  if (joker === "barricade") {
-    const r = consumeJoker(room, color, "barricade");
-    if(!r.ok){ send(ws,{type:"error", code:"NO_JOKER", message:"Barikaden-Joker nicht verfügbar"}); return; }
-    room.state.action.effects.barricadeBy = color;
-    await persistRoomState(room);
-    broadcast(room, { type:"snapshot", state: room.state, players: currentPlayersList(room) });
-    return;
-  }
-
-  send(ws, { type:"error", code:"BAD_JOKER", message:"Unbekannter Joker" });
-  return;
-}
-
-// choose_roll: finalize "choose" joker after 2 rolls
-if (msg.type === "choose_roll") {
-  if (!requireRoomState(room, ws)) return;
-  if (!requireTurn(room, clientId, ws)) return;
-  if (!isActionMode(room)) { send(ws, { type:"error", code:"NOT_ACTION", message:"Action-Modus ist nicht aktiv" }); return; }
-
-  const eff = room.state.action.effects.doubleRoll;
-  if(!eff || eff.kind!=="choose" || eff.by!==room.state.turnColor || !Array.isArray(eff.rolls) || eff.rolls.length!==2){
-    send(ws, { type:"error", code:"NO_CHOICE", message:"Kein Choose-Wurf offen" });
-    return;
-  }
-
-  const pick = Number(msg.pick);
-  if(!(pick===0 || pick===1)){
-    send(ws, { type:"error", code:"BAD_PICK", message:"pick muss 0 oder 1 sein" });
-    return;
-  }
-
-  const v = eff.rolls[pick];
-  room.state.rolled = v;
-  room.lastRollWasSix = (v === 6);
-  room.state.phase = "need_move";
-  room.state.action.effects.doubleRoll = null;
-
-  await persistRoomState(room);
-  broadcast(room, { type:"roll", value: v, state: room.state, detail: { kind:"choose", rolls: eff.rolls.slice(), pick } });
-  return;
-}
-
-// action_barricade_move: move any barricade to a valid place (action joker)
-if (msg.type === "action_barricade_move") {
-  if (!requireRoomState(room, ws)) return;
-  if (!requireTurn(room, clientId, ws)) return;
-  if (!isActionMode(room)) { send(ws, { type:"error", code:"NOT_ACTION", message:"Action-Modus ist nicht aktiv" }); return; }
-
-  const by = room.state.turnColor;
-  const eff = room.state.action.effects;
-  if(!eff || eff.barricadeBy !== by){
-    send(ws, { type:"error", code:"NO_JOKER_ACTIVE", message:"Barikaden-Joker ist nicht aktiv" });
-    return;
-  }
-  if(room.state.phase !== "need_roll"){
-    send(ws, { type:"error", code:"BAD_PHASE", message:"Barikaden-Joker nur vor dem Würfeln" });
-    return;
-  }
-
-  const fromId = String(msg.from || "");
-  const toId = String(msg.to || "");
-
-  const idx = room.state.barricades.indexOf(fromId);
-  if(idx < 0){
-    send(ws, { type:"error", code:"BAD_FROM", message:"Quelle ist keine Barikade" });
-    return;
-  }
-  if(!isPlacableBarricade(room, toId)){
-    send(ws, { type:"error", code:"BAD_TO", message:"Ziel ist nicht gültig" });
-    return;
-  }
-
-  room.state.barricades.splice(idx, 1);
-  room.state.barricades.push(toId);
-
-  room.state.action.effects.barricadeBy = null;
-
-  await persistRoomState(room);
-  broadcast(room, { type:"snapshot", state: room.state, players: currentPlayersList(room) });
-  return;
-}
-
-// ---------- ROLL ----------
+    // ---------- ROLL ----------
     if (msg.type === "roll_request") {
       if (!requireRoomState(room, ws)) return;
       if (!requireTurn(room, clientId, ws)) return;
@@ -1055,50 +903,8 @@ if (msg.type === "action_barricade_move") {
         return;
       }
 
-
-// Action-Modus: Double-Roll Jokers (choose / sum)
-if (isActionMode(room)) {
-  const eff = room.state.action?.effects?.doubleRoll;
-  const by = room.state.turnColor;
-  if (eff && eff.by === by && (eff.kind === "choose" || eff.kind === "sum")) {
-    if (!Array.isArray(eff.rolls)) eff.rolls = [];
-    if (eff.rolls.length >= 2) {
-      send(ws, { type:"error", code:"ALREADY_ROLLED", message:"Schon 2x gewürfelt" });
-      return;
-    }
-
-    const vj = randInt(1, 6);
-    eff.rolls.push(vj);
-    console.log(`[roll] room=${room.code} by=${room.state.turnColor} joker=${eff.kind} value=${vj}`);
-
-    // first roll: keep need_roll for second roll
-    if (eff.rolls.length === 1) {
-      await persistRoomState(room);
-      broadcast(room, { type:"joker_roll", kind: eff.kind, rolls: eff.rolls.slice(), state: room.state });
-      return;
-    }
-
-    // second roll:
-    if (eff.kind === "sum") {
-      const final = Number(eff.rolls[0]) + Number(eff.rolls[1]);
-      room.state.rolled = final;
-      room.lastRollWasSix = (final === 6);
-      room.state.phase = "need_move";
-      room.state.action.effects.doubleRoll = null;
-      await persistRoomState(room);
-      broadcast(room, { type:"roll", value: final, state: room.state, detail: { kind:"sum", rolls: eff.rolls.slice() } });
-      return;
-    }
-
-    // choose: wait for choose_roll
-    await persistRoomState(room);
-    broadcast(room, { type:"joker_roll", kind: "choose", rolls: eff.rolls.slice(), state: room.state });
-    return;
-  }
-}
-
-const v = randInt(1, 6);
-console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
+      const v = randInt(1, 6);
+      console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
 
       room.state.rolled = v;
       room.lastRollWasSix = (v === 6);
@@ -1122,7 +928,6 @@ console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
       room.state.rolled = null;
       room.state.phase = "need_roll";
       room.state.turnColor = nextTurnColor(room, room.state.turnColor);
-      clearTurnEffects(room);
 
       await persistRoomState(room);
     broadcast(room, { type: "move", state: room.state });
@@ -1142,7 +947,7 @@ console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
 
       const pieceId = String(msg.pieceId || "");
       const pc = getPiece(room, pieceId);
-      if (!pc || !canControlPieceInAction(room, room.state.turnColor, pc.color)) {
+      if (!pc || pc.color !== room.state.turnColor) {
         send(ws, { type: "error", code: "BAD_PIECE", message: "Ungültige Figur" });
         return;
       }
@@ -1209,7 +1014,7 @@ if (msg.type === "move_request") {
       const targetId = String(msg.targetId || "");
       const pc = getPiece(room, pieceId);
 
-      if (!pc || !canControlPieceInAction(room, room.state.turnColor, pc.color)) {
+      if (!pc || pc.color !== room.state.turnColor) {
         send(ws, { type: "error", code: "BAD_PIECE", message: "Ungültige Figur" });
         return;
       }
@@ -1261,7 +1066,6 @@ if (msg.type === "move_request") {
         } else {
           room.state.turnColor = nextTurnColor(room, pc.color);
         }
-        clearTurnEffects(room);
         room.state.phase = "need_roll";
         room.state.rolled = null;
       }
