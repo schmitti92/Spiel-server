@@ -576,7 +576,9 @@ function computeAllTargets(room, startNodeId, steps, color, pieceId) {
 function pathForTarget(room, piece, targetId) {
   const color = piece.color;
   const roll = room.state.rolled;
-  if (!(roll >= 1 && roll <= 6)) return { ok: false, msg: "no roll" };
+  // Doppelwurf kann 7–12 ergeben. Der Server setzt room.state.rolled,
+  // daher ist es sicher, hier bis 12 zuzulassen.
+  if (!(roll >= 1 && roll <= 12)) return { ok: false, msg: "no roll" };
 
   const startField = STARTS[color];
   if (!startField || !NODES.has(startField)) return { ok: false, msg: "missing start in board.meta.starts" };
