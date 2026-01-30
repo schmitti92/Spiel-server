@@ -990,25 +990,24 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      
 
-if (joker === "reroll") {
-  if (set.reroll !== true) { send(ws, { type: "error", code: "USED", message: "Neu-Wurf Joker schon verbraucht" }); return; }
-  // Neu-Wurf ist erst NACH dem Würfeln erlaubt (Phase need_move) und setzt den Wurf zurück.
-  if (room.state.phase !== "need_move" || room.state.rolled == null) {
-    send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Neu-Wurf" });
-    return;
-  }
-  // Erste Zahl verfällt -> zurück zu need_roll
-  room.state.rolled = null;
-  room.state.phase = "need_roll";
-  markUsed("reroll");
-  await persistRoomState(room);
-  broadcast(room, { type: "snapshot", state: room.state, joker: "reroll" });
-  return;
-}
+      if (joker === "reroll") {
+        if (set.reroll !== true) { send(ws, { type: "error", code: "USED", message: "Neu-Wurf Joker schon verbraucht" }); return; }
+        // Neu-Wurf-Joker: erst NACH dem Würfeln (need_move) nutzbar
+        if (room.state.phase !== "need_move" || room.state.rolled == null) {
+          send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Neu-Wurf" });
+          return;
+        }
+        // Wurf verfällt -> zurück in need_roll
+        room.state.rolled = null;
+        room.state.phase = "need_roll";
+        markUsed("reroll");
+        await persistRoomState(room);
+        broadcast(room, { type: "snapshot", state: room.state, joker: "reroll" });
+        return;
+      }
 
-if (joker === "choose" || joker === "sum") {
+      if (joker === "choose" || joker === "sum") {
         send(ws, { type: "error", code: "NOT_READY", message: "Choose/Summe kommt im nächsten Schritt (sonst Risiko mit Würfel-UI)" });
         return;
       }
