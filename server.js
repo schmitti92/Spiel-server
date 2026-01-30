@@ -253,6 +253,8 @@ function makeRoom(code) {
   return {
     code,
     hostToken: null, // stable host identity (sessionToken)
+    // Socket index for this room (used for host-swap/reconnect messaging)
+    clients: new Map(), // clientId -> ws
     players: new Map(), // clientId -> {id,name,color,isHost,sessionToken,lastSeen}
     state: null,
     lastRollWasSix: false,
@@ -318,35 +320,15 @@ function broadcast(room, obj) {
   }
 }
 
-
-// ---------------------------------------------------------------------------
-// Realtime safety net (Render/WebSocket/Router hiccups):
-// Broadcasts a lightweight snapshot periodically so clients resync without manual refresh.
-// This also prevents "idle" connections from going stale on some networks.
-// ---------------------------------------------------------------------------
-const SNAPSHOT_TICK_MS = 2500;
-setInterval(() => {
-  try {
-    for (const room of rooms.values()) {
-      if (!room || !room.state) continue;
-      // Only tick when a room is actually being used (has at least 1 connected socket)
-      let anyConn = false;
-      for (const p of room.players.values()) { if (p && p.connected) { anyConn = true; break; } }
-      if (!anyConn) continue;
-
-      broadcast(room, {
-        type: "snapshot",
-        state: room.state,
-        players: currentPlayersList(room)
-      });
-    }
-  } catch (e) {
-    console.warn("snapshot tick error", e?.message || e);
-  }
-}, SNAPSHOT_TICK_MS);
-
-
 function send(ws, obj) {
+  try { ws.send(JSON.stringify(obj)); } catch (_e) {}
+}
+
+// Defensive helper: accepts possibly-undefined ws and never throws.
+// (We saw crashes when a reconnect/host-swap tried to message a socket
+// that was already gone.)
+function safeSend(ws, obj) {
+  if (!ws || ws.readyState !== 1) return;
   try { ws.send(JSON.stringify(obj)); } catch (_e) {}
 }
 
@@ -370,7 +352,7 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-function initGameState(room, activeColors) {
+function initGameState(room, activeColors, mode = "classic") {
   // Normalize activeColors (colors that are actually participating in turn order).
   activeColors = Array.isArray(activeColors) && activeColors.length
     ? activeColors.map(c => String(c).toLowerCase())
@@ -433,9 +415,34 @@ function initGameState(room, activeColors) {
   const carryingByColor = { red: false, blue: false, green: false, yellow: false };
   room.carryingByColor = carryingByColor; // backward-compat alias
 
+  // ===== Mode / Action-Mode Jokers (server is chef) =====
+  const gameMode = (String(mode || "classic").toLowerCase() === "action") ? "action" : "classic";
+
+  // Action state lives fully on the server (persisted in room.state).
+  // Client UI only reads this snapshot.
+  const action = (gameMode === "action") ? {
+    // Per color: each joker can be used exactly once per game
+    jokersByColor: {
+      red:      { choose: true, sum: true, allColors: true, barricade: true },
+      blue:     { choose: true, sum: true, allColors: true, barricade: true },
+      green:    { choose: true, sum: true, allColors: true, barricade: true },
+      yellow:   { choose: true, sum: true, allColors: true, barricade: true },
+    },
+    // Active effects for the CURRENT turn only (cleared on end_turn)
+    effects: {
+      allColorsBy: null,   // color that may move any piece this turn
+      barricadeBy: null,   // color that may move one barricade this turn
+      doubleRoll: null,    // {kind:"choose"|"sum", by:"red", rolls:[..], chosen?:n }
+    },
+    // version for future-proofing (optional)
+    v: 1,
+  } : null;
+
   room.state = {
     started: true,
     paused: false,
+    mode: gameMode,
+    action,
     turnColor,
     phase: "need_roll", // need_roll | need_move | place_barricade
     rolled: null,
@@ -740,8 +747,10 @@ if (!color) {
 }
 
 room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, lastSeen: Date.now() });
-      // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
-      c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
+	      // Auto-unpause deaktiviert: Fortsetzen nur per Host (resume)
+	      c.room = roomCode; c.name = name; c.sessionToken = sessionToken;
+	      // keep per-room socket map in sync (host-swap/reconnect depends on it)
+	      room.clients.set(clientId, ws);
 
       // Reconnect-Sicherheit: Wenn noch nicht wieder 2 Spieler verbunden sind,
       // pausieren wir den Raum sofort (auch nach Server-Restart/Restore).
@@ -857,7 +866,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      initGameState(room, uniqueAct);
+      initGameState(room, uniqueAct, msg.mode || "classic");
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
@@ -902,7 +911,124 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       await persistRoomState(room);
       broadcast(room, { type: "snapshot", state: room.state });
       return;
+    }    // ---------- ACTION MODE: JOKERS (server is chef) ----------
+    // Safety-first rollout:
+    // - allColors + barricade are enabled (low risk)
+    // - choose + sum are reserved for next step (needs dice UI for 7-12 etc.)
+    if (msg.type === "use_joker") {
+      if (!requireRoomState(room, ws)) return;
+      if (!requireTurn(room, clientId, ws)) return;
+
+      if (String(room.state.mode || "classic") !== "action" || !room.state.action) {
+        send(ws, { type: "error", code: "NOT_ACTION", message: "Action-Modus ist nicht aktiv" });
+        return;
+      }
+
+      const turnColor = room.state.turnColor;
+      const set = room.state.action.jokersByColor?.[turnColor];
+      if (!set) { send(ws, { type: "error", code: "NO_JOKERS", message: "Joker-Set fehlt" }); return; }
+
+      const joker = String(msg.joker || "").toLowerCase().trim();
+
+      // helper: mark used
+      const markUsed = (k) => { if (set && set[k] === true) set[k] = false; };
+
+      if (joker === "allcolors") {
+        if (set.allColors !== true) { send(ws, { type: "error", code: "USED", message: "Alle Farben Joker schon verbraucht" }); return; }
+        // Wunsch: Joker erst NACH dem Würfeln (Phase need_move)
+        if (room.state.phase !== "need_move" || room.state.rolled == null) {
+          send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Joker wählen" });
+          return;
+        }
+        room.state.action.effects.allColorsBy = turnColor;
+        markUsed("allColors");
+        await persistRoomState(room);
+        broadcast(room, { type: "snapshot", state: room.state, joker: "allcolors" });
+        return;
+      }
+
+      if (joker === "barricade") {
+        if (set.barricade !== true) { send(ws, { type: "error", code: "USED", message: "Barikade Joker schon verbraucht" }); return; }
+        // Barikade-Joker soll *vor* dem Würfeln eingesetzt werden.
+        // Wenn man ihn nach dem Wurf aktiviert, kann der Spieler die Barikade nicht mehr bewegen
+        // (weil das Spiel dann in phase=need_move ist) und es fühlt sich "buggy" an.
+        if (room.state.phase !== "need_roll" || room.state.rolled != null) {
+          send(ws, { type: "error", code: "BAD_PHASE", message: "Barikade-Joker nur vor dem Würfeln" });
+          return;
+        }
+        
+        // Falls schon aktiv (z.B. Doppel-Klick), nicht nochmal „verbrauchen“.
+        if (room.state.action.effects.barricadeBy === turnColor) {
+          broadcast(room, { type: "snapshot", state: room.state, joker: "barricade" });
+          return;
+        }
+
+        room.state.action.effects.barricadeBy = turnColor;
+        // NOTE: Joker wird erst nach erfolgreichem Versetzen verbraucht (Commit in action_barricade_move)
+        await persistRoomState(room);
+        broadcast(room, { type: "snapshot", state: room.state, joker: "barricade" });
+        return;
+      }
+
+      if (joker === "choose" || joker === "sum") {
+        send(ws, { type: "error", code: "NOT_READY", message: "Choose/Summe kommt im nächsten Schritt (sonst Risiko mit Würfel-UI)" });
+        return;
+      }
+
+      send(ws, { type: "error", code: "BAD_JOKER", message: "Unbekannter Joker" });
+      return;
     }
+
+    if (msg.type === "action_barricade_move") {
+      if (!requireRoomState(room, ws)) return;
+      if (!requireTurn(room, clientId, ws)) return;
+
+      if (String(room.state.mode || "classic") !== "action" || !room.state.action) {
+        send(ws, { type: "error", code: "NOT_ACTION", message: "Action-Modus ist nicht aktiv" });
+        return;
+      }
+
+      const turnColor = room.state.turnColor;
+      const eff = room.state.action.effects || {};
+      if (eff.barricadeBy !== turnColor) {
+        send(ws, { type: "error", code: "NO_EFFECT", message: "Barikade-Effekt ist nicht aktiv" });
+        return;
+      }
+      if (room.state.phase !== "need_roll") {
+        send(ws, { type: "error", code: "BAD_PHASE", message: "Barikade-Joker nur vor dem Würfeln" });
+        return;
+      }
+
+      const from = String(msg.from || "");
+      const to   = String(msg.to || "");
+      if (!from || !to) { send(ws, { type: "error", code: "BAD_ARGS", message: "from/to fehlt" }); return; }
+      if (from === to) { send(ws, { type: "error", code: "BAD_ARGS", message: "Quelle = Ziel" }); return; }
+      if (to === String(room.state.goal)) { send(ws, { type: "error", code: "GOAL_BLOCKED", message: "Ziel-Feld ist gesperrt" }); return; }
+
+      const barr = room.state.barricades || [];
+      if (!barr.includes(from)) { send(ws, { type: "error", code: "NO_BARR", message: "Quelle hat keine Barikade" }); return; }
+      if (barr.includes(to)) { send(ws, { type: "error", code: "HAS_BARR", message: "Ziel hat schon eine Barikade" }); return; }
+
+      // move
+      room.state.barricades = barr.filter(x => x !== from);
+      room.state.barricades.push(to);
+
+      // effect is single-use per turn -> clear now
+      room.state.action.effects.barricadeBy = null;
+
+
+      // Commit: Joker jetzt verbrauchen (erst nach erfolgreichem Move)
+      try{
+        if (room.state.action && room.state.action.jokersByColor && room.state.action.jokersByColor[turnColor]) {
+          room.state.action.jokersByColor[turnColor].barricade = false;
+        }
+      }catch(_e){}
+      await persistRoomState(room);
+      broadcast(room, { type: "snapshot", state: room.state, moved: { from, to } });
+      return;
+    }
+
+
 
     // ---------- ROLL ----------
     if (msg.type === "roll_request") {
@@ -935,6 +1061,15 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
+      // Action-Mode: clear per-turn effects when a turn ends (prevents desync / stuck effects)
+      if (String(room.state.mode || "classic") === "action" && room.state.action && room.state.action.effects) {
+        const ended = room.state.turnColor;
+        const eff = room.state.action.effects;
+        if (eff.allColorsBy === ended) eff.allColorsBy = null;
+        if (eff.barricadeBy === ended) eff.barricadeBy = null;
+        if (eff.doubleRoll && eff.doubleRoll.by === ended) eff.doubleRoll = null;
+      }
+
       room.lastRollWasSix = false;
       room.state.rolled = null;
       room.state.phase = "need_roll";
@@ -958,7 +1093,9 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       const pieceId = String(msg.pieceId || "");
       const pc = getPiece(room, pieceId);
-      if (!pc || pc.color !== room.state.turnColor) {
+      const allowAll = (String(room.state.mode || "classic") === "action") && room.state.action && room.state.action.effects && (room.state.action.effects.allColorsBy === room.state.turnColor);
+
+      if (!pc || (!allowAll && pc.color !== room.state.turnColor)) {
         send(ws, { type: "error", code: "BAD_PIECE", message: "Ungültige Figur" });
         return;
       }
@@ -1025,7 +1162,15 @@ if (msg.type === "move_request") {
       const targetId = String(msg.targetId || "");
       const pc = getPiece(room, pieceId);
 
-      if (!pc || pc.color !== room.state.turnColor) {
+      // Action‑Mode Joker "Alle Farben": aktiver Spieler bleibt turnColor,
+      // aber darf (einmalig) auch fremde Figuren bewegen.
+      const activeColor = room.state.turnColor;
+      const allowAll = (String(room.state.mode || "classic") === "action")
+        && room.state.action
+        && room.state.action.effects
+        && (room.state.action.effects.allColorsBy === activeColor);
+
+      if (!pc || (!allowAll && pc.color !== activeColor)) {
         send(ws, { type: "error", code: "BAD_PIECE", message: "Ungültige Figur" });
         return;
       }
@@ -1063,7 +1208,7 @@ if (msg.type === "move_request") {
         if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
   room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
         }
-        room.state.carryingByColor[pc.color] = true;
+        room.state.carryingByColor[activeColor] = true;
         room.carryingByColor = room.state.carryingByColor; // compat alias
         room.state.phase = "place_barricade";
       } else {
@@ -1073,15 +1218,22 @@ if (msg.type === "move_request") {
       // if no barricade placement needed:
       if (!picked) {
         if (room.lastRollWasSix) {
-          room.state.turnColor = pc.color; // extra roll
+          room.state.turnColor = activeColor; // extra roll (Joker-sicher)
         } else {
-          room.state.turnColor = nextTurnColor(room, pc.color);
+          room.state.turnColor = nextTurnColor(room, activeColor);
         }
         room.state.phase = "need_roll";
         room.state.rolled = null;
       }
 
-      console.log(`[move] room=${room.code} color=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
+      // Joker‑Effekt endet nach dem Zug (verhindert Turn‑Chaos)
+      if (String(room.state.mode || "classic") === "action" && room.state.action && room.state.action.effects) {
+        if (room.state.action.effects.allColorsBy === activeColor) {
+          room.state.action.effects.allColorsBy = null;
+        }
+      }
+
+      console.log(`[move] room=${room.code} active=${activeColor} moved=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
       broadcast(room, {
         type: "move",
         action: { pieceId: pc.id, path: res.path, pickedBarricade: picked, kickedPieces: kicked },
@@ -1216,6 +1368,8 @@ if (msg.type === "place_barricade") {
     if (roomCode) {
       const room = rooms.get(roomCode);
       if (room) {
+	      // keep per-room socket index clean
+	      if (room.clients) room.clients.delete(clientId);
         const p = room.players.get(clientId);
         const wasColor = p?.color;
         const wasTurn = room.state?.turnColor;
@@ -1244,5 +1398,29 @@ if (msg.type === "place_barricade") {
     clients.delete(clientId);
   });
 });
+
+
+
+// ---------- Snapshot Heartbeat (Server is Chef) ----------
+// Sends the current authoritative snapshot periodically so clients can resync after
+// Render sleep/reconnect/message-loss without any risky auto-repair.
+// Safe: does NOT change game state, only broadcasts existing room.state.
+const SNAPSHOT_HEARTBEAT_MS = Number(process.env.SNAPSHOT_HEARTBEAT_MS || 3000);
+
+setInterval(() => {
+  try {
+    for (const room of rooms.values()) {
+      if (!room || !room.state || !room.state.started) continue;
+
+      // only if at least one connected player is present
+      const hasConnected = Array.from(room.players.values()).some(p => isConnectedPlayer(p));
+      if (!hasConnected) continue;
+
+      broadcast(room, { type: "snapshot", state: room.state, hb: true, ts: Date.now() });
+    }
+  } catch (_e) {
+    // never crash the server because of heartbeat
+  }
+}, SNAPSHOT_HEARTBEAT_MS);
 
 server.listen(PORT, () => console.log("Barikade server listening on", PORT));
