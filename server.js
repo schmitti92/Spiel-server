@@ -312,6 +312,21 @@ function resumeIfReady(room) {
 
 function broadcast(room, obj) {
   const msg = JSON.stringify(obj);
+
+  // Hotfix: broadcast to currently connected sockets in this room.
+  // This prevents missing real-time updates when player records are stale
+  // (e.g. refresh/reconnect) but the websocket is already connected.
+  const map = room?.clients;
+  if (map && map instanceof Map) {
+    for (const ws of map.values()) {
+      if (ws?.readyState === 1) {
+        try { ws.send(msg); } catch (_e) {}
+      }
+    }
+    return;
+  }
+
+  // Fallback: older behavior
   for (const p of room.players.values()) {
     const c = clients.get(p.id);
     if (c?.ws?.readyState === 1) {
@@ -319,6 +334,7 @@ function broadcast(room, obj) {
     }
   }
 }
+
 
 function send(ws, obj) {
   try { ws.send(JSON.stringify(obj)); } catch (_e) {}
@@ -649,6 +665,8 @@ wss.on("connection", (ws) => {
       // get/create room
       let room = rooms.get(roomCode);
       if (!room) { room = makeRoom(roomCode); rooms.set(roomCode, room); }
+      // hotfix: ensure per-room ws map exists (prevents crashes after restore)
+      if (!room.clients || !(room.clients instanceof Map)) room.clients = new Map();
 
       // If server restarted / room.state missing, try to restore from disk (best-effort)
       if (!room.state) {
@@ -668,7 +686,7 @@ wss.on("connection", (ws) => {
       if (existing) {
         // Prevent a NEW client from kicking a currently-connected player that uses the same sessionToken.
         // If the old one is truly disconnected, reconnect still works (old ws not in room.clients).
-        const existingWs = room.clients.get(existing.id);
+        const existingWs = (room.clients && room.clients.get) ? room.clients.get(existing.id) : null;
         if (existingWs && existingWs.readyState === 1 && existing.id !== clientId) {
           safeSend(ws, { t: "error", code: "DUPLICATE_SESSION", message: "Diese Sitzung ist bereits verbunden (Session bereits aktiv)." });
           try { ws.close(4000, "DUPLICATE_SESSION"); } catch (_) {}
@@ -774,6 +792,8 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
     if (!roomCode) return;
     const room = rooms.get(roomCode);
     if (!room) return;
+    // hotfix: ensure per-room ws map exists (prevents crashes)
+    if (!room.clients || !(room.clients instanceof Map)) room.clients = new Map();
 
     if (msg.type === "leave") {
       room.players.delete(clientId);
