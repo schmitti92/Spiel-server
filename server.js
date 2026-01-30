@@ -949,6 +949,13 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       if (joker === "barricade") {
         if (set.barricade !== true) { send(ws, { type: "error", code: "USED", message: "Barikade Joker schon verbraucht" }); return; }
+        // Barikade-Joker soll *vor* dem Würfeln eingesetzt werden.
+        // Wenn man ihn nach dem Wurf aktiviert, kann der Spieler die Barikade nicht mehr bewegen
+        // (weil das Spiel dann in phase=need_move ist) und es fühlt sich "buggy" an.
+        if (room.state.phase !== "need_roll" || room.state.rolled != null) {
+          send(ws, { type: "error", code: "BAD_PHASE", message: "Barikade-Joker nur vor dem Würfeln" });
+          return;
+        }
         room.state.action.effects.barricadeBy = turnColor;
         markUsed("barricade");
         await persistRoomState(room);
