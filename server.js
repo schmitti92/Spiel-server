@@ -439,10 +439,10 @@ function initGameState(room, activeColors, mode = "classic") {
   const action = (gameMode === "action") ? {
     // Per color: each joker can be used exactly once per game
     jokersByColor: {
-      red:      { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
-      blue:     { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
-      green:    { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
-      yellow:   { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
+      red:      { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
+      blue:     { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
+      green:    { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
+      yellow:   { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
     },
     // Active effects for the CURRENT turn only (cleared on end_turn)
     effects: {
@@ -1007,7 +1007,27 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      if (joker === "choose" || joker === "sum") {
+      
+      if (joker === "double") {
+        if (set.double !== true) { send(ws, { type: "error", code: "USED", message: "Doppelwurf Joker schon verbraucht" }); return; }
+        // Doppelwurf-Joker soll *vor* dem Würfeln eingesetzt werden.
+        if (room.state.phase !== "need_roll" || room.state.rolled != null) {
+          send(ws, { type: "error", code: "BAD_PHASE", message: "Doppelwurf nur vor dem Würfeln" });
+          return;
+        }
+        // Falls schon aktiv, nicht nochmal verbrauchen
+        if (room.state.action.effects.doubleRoll && room.state.action.effects.doubleRoll.by === turnColor && room.state.action.effects.doubleRoll.kind === "sum2" && room.state.action.effects.doubleRoll.pending === true) {
+          broadcast(room, { type: "snapshot", state: room.state, joker: "double" });
+          return;
+        }
+        room.state.action.effects.doubleRoll = { kind: "sum2", by: turnColor, pending: true, rolls: null, chosen: null };
+        markUsed("double");
+        await persistRoomState(room);
+        broadcast(room, { type: "snapshot", state: room.state, joker: "double" });
+        return;
+      }
+
+if (joker === "choose" || joker === "sum") {
         send(ws, { type: "error", code: "NOT_READY", message: "Choose/Summe kommt im nächsten Schritt (sonst Risiko mit Würfel-UI)" });
         return;
       }
@@ -1077,14 +1097,34 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      const v = randInt(1, 6);
+      let v = randInt(1, 6);
+      let double = null;
+
+      // Action-Mode: Doppelwurf (2x würfeln, Summe) – wird VOR dem Würfeln aktiviert
+      try{
+        if (String(room.state.mode || "classic") === "action" && room.state.action && room.state.action.effects) {
+          const eff = room.state.action.effects.doubleRoll;
+          if (eff && eff.by === room.state.turnColor && eff.kind === "sum2" && eff.pending === true) {
+            const a = randInt(1, 6);
+            const b = randInt(1, 6);
+            v = a + b;
+            double = [a, b];
+            eff.pending = false;
+            eff.rolls = [a, b];
+            eff.chosen = v;
+            // Effekt nach dem Wurf entfernen (Joker ist ohnehin schon verbraucht)
+            room.state.action.effects.doubleRoll = null;
+          }
+        }
+      }catch(_e){}
+
       console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
 
       room.state.rolled = v;
       room.lastRollWasSix = (v === 6);
       room.state.phase = "need_move";
       await persistRoomState(room);
-    broadcast(room, { type: "roll", value: v, state: room.state });
+    broadcast(room, { type: "roll", value: v, state: room.state, double });
       return;
     }
 
