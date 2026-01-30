@@ -956,8 +956,15 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
           send(ws, { type: "error", code: "BAD_PHASE", message: "Barikade-Joker nur vor dem Würfeln" });
           return;
         }
+        
+        // Falls schon aktiv (z.B. Doppel-Klick), nicht nochmal „verbrauchen“.
+        if (room.state.action.effects.barricadeBy === turnColor) {
+          broadcast(room, { type: "snapshot", state: room.state, joker: "barricade" });
+          return;
+        }
+
         room.state.action.effects.barricadeBy = turnColor;
-        markUsed("barricade");
+        // NOTE: Joker wird erst nach erfolgreichem Versetzen verbraucht (Commit in action_barricade_move)
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "barricade" });
         return;
@@ -1009,6 +1016,13 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       // effect is single-use per turn -> clear now
       room.state.action.effects.barricadeBy = null;
 
+
+      // Commit: Joker jetzt verbrauchen (erst nach erfolgreichem Move)
+      try{
+        if (room.state.action && room.state.action.jokersByColor && room.state.action.jokersByColor[turnColor]) {
+          room.state.action.jokersByColor[turnColor].barricade = false;
+        }
+      }catch(_e){}
       await persistRoomState(room);
       broadcast(room, { type: "snapshot", state: room.state, moved: { from, to } });
       return;
