@@ -439,10 +439,10 @@ function initGameState(room, activeColors, mode = "classic") {
   const action = (gameMode === "action") ? {
     // Per color: each joker can be used exactly once per game
     jokersByColor: {
-      red:      { choose: true, sum: true, allColors: true, barricade: true },
-      blue:     { choose: true, sum: true, allColors: true, barricade: true },
-      green:    { choose: true, sum: true, allColors: true, barricade: true },
-      yellow:   { choose: true, sum: true, allColors: true, barricade: true },
+      red:      { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
+      blue:     { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
+      green:    { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
+      yellow:   { choose: true, sum: true, allColors: true, barricade: true, reroll: true },
     },
     // Active effects for the CURRENT turn only (cleared on end_turn)
     effects: {
@@ -990,7 +990,25 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      if (joker === "choose" || joker === "sum") {
+      
+
+if (joker === "reroll") {
+  if (set.reroll !== true) { send(ws, { type: "error", code: "USED", message: "Neu-Wurf Joker schon verbraucht" }); return; }
+  // Neu-Wurf ist erst NACH dem Würfeln erlaubt (Phase need_move) und setzt den Wurf zurück.
+  if (room.state.phase !== "need_move" || room.state.rolled == null) {
+    send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Neu-Wurf" });
+    return;
+  }
+  // Erste Zahl verfällt -> zurück zu need_roll
+  room.state.rolled = null;
+  room.state.phase = "need_roll";
+  markUsed("reroll");
+  await persistRoomState(room);
+  broadcast(room, { type: "snapshot", state: room.state, joker: "reroll" });
+  return;
+}
+
+if (joker === "choose" || joker === "sum") {
         send(ws, { type: "error", code: "NOT_READY", message: "Choose/Summe kommt im nächsten Schritt (sonst Risiko mit Würfel-UI)" });
         return;
       }
