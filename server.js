@@ -311,12 +311,11 @@ function resumeIfReady(room) {
 
 
 function broadcast(room, obj) {
-  const msg = JSON.stringify(obj);
-  for (const p of room.players.values()) {
-    const c = clients.get(p.id);
-    if (c?.ws?.readyState === 1) {
-      try { c.ws.send(msg); } catch (_e) {}
-    }
+  // IMPORTANT: send updates to ALL sockets connected to the room.
+  // Do NOT iterate room.players here, otherwise a client can miss updates during
+  // reconnect / cleanup windows (observed as "Blau bekommt Würfel-Updates nicht").
+  for(const ws of getOpenClientSockets(room)){
+    safeSend(ws, obj);
   }
 }
 
@@ -331,6 +330,16 @@ function safeSend(ws, obj) {
   if (!ws || ws.readyState !== 1) return;
   try { ws.send(JSON.stringify(obj)); } catch (_e) {}
 }
+
+function getOpenClientSockets(room){
+  const out = [];
+  if(!room || !room.clients) return out;
+  for(const ws of room.clients.values()){
+    if(ws && ws.readyState === WebSocket.OPEN) out.push(ws);
+  }
+  return out;
+}
+
 
 function assignColorsRandom(room) {
   // remove offline placeholders on reset
