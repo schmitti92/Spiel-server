@@ -1276,31 +1276,34 @@ if (msg.type === "move_request") {
       }
 
 
-      // ----- Glücksrad (nur Action-Mode): wenn eine Figur rausgeschmissen wird -----
-      // Regel (Christoph): Rad dreht 10s, 50% Chance auf Joker (4 Joker + 4 Nieten).
-      // Gewinner ist der rausgeschmissene Spieler (Farbe der gekickten Figur), Joker kommt "zusätzlich".
-      const wheel = [];
-      try{
-        const isAction = (String(room.state.mode || "classic") === "action");
+
+      // Wheel: if a piece is kicked in Action-Mode, the kicked color gets a 50% chance to receive a random joker.
+      // Server decides instantly (no delays). Client may animate it visually.
+      let wheel = null;
+      try {
+        const isAction = String(room.state.mode || "classic") === "action";
         const jb = room.state?.action?.jokersByColor;
-        if(isAction && jb && kicked.length){
+        if (isAction && jb && kicked.length) {
           const kickedColors = new Set();
-          for(const pid of kicked){
+          for (const pid of kicked) {
             const pp = room.state.pieces.find(x => String(x.id) === String(pid));
-            if(pp && pp.color) kickedColors.add(pp.color);
+            if (pp && pp.color) kickedColors.add(pp.color);
           }
-          const segments = ["allColors","none","barricade","none","reroll","none","double","none"]; // 50%
-          for(const kc of kickedColors){
-            const pick = segments[Math.floor(Math.random()*segments.length)];
+          const segments = ["allColors", "none", "barricade", "none", "reroll", "none", "double", "none"]; // 50% none
+          wheel = [];
+          for (const kc of kickedColors) {
+            const pick = segments[Math.floor(Math.random() * segments.length)];
             const result = (pick === "none") ? null : pick;
             wheel.push({ targetColor: kc, result, durationMs: 10000 });
-            if(result){
-              if(!jb[kc]) jb[kc] = {};
-              jb[kc][result] = true; // Joker "zusätzlich" geben (auch wenn vorher verbraucht)
+            if (result) {
+              if (!jb[kc]) jb[kc] = {};
+              jb[kc][result] = true; // grant as "extra" even if previously used
             }
           }
         }
-      }catch(_e){}
+      } catch (_e) {
+        wheel = null;
+      }
       // landed on barricade?
       const barricades = room.state.barricades;
       const idx = barricades.indexOf(landed);
@@ -1342,7 +1345,7 @@ if (msg.type === "move_request") {
       broadcast(room, {
         type: "move",
         action: { pieceId: pc.id, path: res.path, pickedBarricade: picked, kickedPieces: kicked },
-        wheel: (typeof wheel !== 'undefined' ? wheel : undefined),
+        wheel: wheel || undefined,
         state: room.state
       });
       // Persist after every successful move so a server restart has the newest possible state.
