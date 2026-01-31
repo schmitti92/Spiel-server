@@ -17,6 +17,94 @@ const PORT = process.env.PORT || 10000;
 // im Match verwendeten Farben). Pieces existieren aber immer für alle 4 Farben.
 const ALLOWED_COLORS = ["red", "blue", "green", "yellow"];
 
+// ---------- Action-Mode Joker Stacks (v2) ----------
+// We keep the existing action.jokersByColor for backwards compatibility,
+// but internally we store earned/base jokers as arrays with an "origin color".
+// This allows: multiple jokers per type, and correct display of the kicked color.
+const ACTION_JOKER_TYPES = ["choose","sum","allColors","barricade","reroll","double"];
+
+function ensureActionJokers(action){
+  if(!action) return;
+  if(!action.jokersOwned || typeof action.jokersOwned !== "object"){
+    action.jokersOwned = { red: [], blue: [], green: [], yellow: [] };
+  } else {
+    for(const c of ALLOWED_COLORS){
+      if(!Array.isArray(action.jokersOwned[c])) action.jokersOwned[c] = [];
+    }
+  }
+  if(!action.jokersByColor || typeof action.jokersByColor !== "object"){
+    action.jokersByColor = {
+      red:      { choose:0, sum:0, allColors:0, barricade:0, reroll:0, double:0 },
+      blue:     { choose:0, sum:0, allColors:0, barricade:0, reroll:0, double:0 },
+      green:    { choose:0, sum:0, allColors:0, barricade:0, reroll:0, double:0 },
+      yellow:   { choose:0, sum:0, allColors:0, barricade:0, reroll:0, double:0 },
+    };
+  } else {
+    for(const c of ALLOWED_COLORS){
+      if(!action.jokersByColor[c] || typeof action.jokersByColor[c] !== "object"){
+        action.jokersByColor[c] = { choose:0, sum:0, allColors:0, barricade:0, reroll:0, double:0 };
+      }
+      for(const t of ACTION_JOKER_TYPES){
+        const v = action.jokersByColor[c][t];
+        if(v === true) action.jokersByColor[c][t] = 1;
+        else if(v === false || v == null) action.jokersByColor[c][t] = 0;
+        else if(typeof v !== "number" || !isFinite(v)) action.jokersByColor[c][t] = 0;
+        else action.jokersByColor[c][t] = Math.max(0, Math.floor(v));
+      }
+    }
+  }
+}
+
+function syncJokerCountsFromOwned(action){
+  if(!action) return;
+  ensureActionJokers(action);
+  for(const c of ALLOWED_COLORS){
+    const owned = action.jokersOwned[c] || [];
+    const counts = { choose:0, sum:0, allColors:0, barricade:0, reroll:0, double:0 };
+    for(const j of owned){
+      const t = String(j?.type || "");
+      if(counts[t] != null) counts[t] += 1;
+    }
+    action.jokersByColor[c] = counts;
+  }
+}
+
+function addOwnedJoker(action, ownerColor, type, originColor, source="wheel"){
+  if(!action) return;
+  ensureActionJokers(action);
+  if(!ALLOWED_COLORS.includes(ownerColor)) return;
+  const t = String(type || "");
+  if(!ACTION_JOKER_TYPES.includes(t)) return;
+  const origin = ALLOWED_COLORS.includes(originColor) ? originColor : ownerColor;
+  action.jokersOwned[ownerColor].push({ type: t, color: origin, source, ts: Date.now() });
+  syncJokerCountsFromOwned(action);
+}
+
+function consumeOwnedJoker(action, ownerColor, type){
+  if(!action) return null;
+  ensureActionJokers(action);
+  if(!ALLOWED_COLORS.includes(ownerColor)) return null;
+  const t = String(type || "");
+  const arr = action.jokersOwned[ownerColor];
+  if(!Array.isArray(arr) || !arr.length) return null;
+  const idx = arr.findIndex(j => String(j?.type) === t);
+  if(idx < 0) return null;
+  const [removed] = arr.splice(idx, 1);
+  syncJokerCountsFromOwned(action);
+  return removed || null;
+}
+
+function countOwnedJokers(action, ownerColor, type){
+  if(!action) return 0;
+  ensureActionJokers(action);
+  const arr = action.jokersOwned?.[ownerColor];
+  if(!Array.isArray(arr)) return 0;
+  const t = String(type || "");
+  let n = 0;
+  for(const j of arr){ if(String(j?.type) === t) n++; }
+  return n;
+}
+
 function roomUpdatePayload(room, playersOverride) {
   return {
     type: "room_update",
@@ -147,6 +235,34 @@ async function restoreRoomState(room){
         }
         if (!Array.isArray(room.state.activeColors)) room.state.activeColors = [];
         room.carryingByColor = room.state.carryingByColor;
+
+        // Action-Mode Joker backward-compat / defaults
+        try{
+          if (String(room.state.mode || "classic") === "action" && room.state.action) {
+            ensureActionJokers(room.state.action);
+            // If we restored an old snapshot without jokersOwned, rebuild it from counts/booleans.
+            let hasOwned = room.state.action.jokersOwned && typeof room.state.action.jokersOwned === "object";
+            if (!hasOwned) room.state.action.jokersOwned = { red: [], blue: [], green: [], yellow: [] };
+            for (const c of ALLOWED_COLORS) {
+              if (!Array.isArray(room.state.action.jokersOwned[c])) room.state.action.jokersOwned[c] = [];
+            }
+            // If owned arrays are empty but jokersByColor has counts, rebuild.
+            const emptyAll = ALLOWED_COLORS.every(c => (room.state.action.jokersOwned[c].length === 0));
+            if (emptyAll && room.state.action.jokersByColor) {
+              for (const c of ALLOWED_COLORS) {
+                const set = room.state.action.jokersByColor[c] || {};
+                for (const t of ACTION_JOKER_TYPES) {
+                  const v = set[t];
+                  const n = (v===true) ? 1 : ((typeof v==="number" && isFinite(v)) ? Math.max(0, Math.floor(v)) : 0);
+                  for (let i=0;i<n;i++){
+                    room.state.action.jokersOwned[c].push({ type: t, color: c, source: "legacy", ts: Date.now() });
+                  }
+                }
+              }
+            }
+            syncJokerCountsFromOwned(room.state.action);
+          }
+        }catch(_e){}
         return true;
       }
     }
@@ -171,6 +287,34 @@ async function restoreRoomState(room){
       }
       if (!Array.isArray(room.state.activeColors)) room.state.activeColors = [];
       room.carryingByColor = room.state.carryingByColor;
+
+        // Action-Mode Joker backward-compat / defaults
+        try{
+          if (String(room.state.mode || "classic") === "action" && room.state.action) {
+            ensureActionJokers(room.state.action);
+            // If we restored an old snapshot without jokersOwned, rebuild it from counts/booleans.
+            let hasOwned = room.state.action.jokersOwned && typeof room.state.action.jokersOwned === "object";
+            if (!hasOwned) room.state.action.jokersOwned = { red: [], blue: [], green: [], yellow: [] };
+            for (const c of ALLOWED_COLORS) {
+              if (!Array.isArray(room.state.action.jokersOwned[c])) room.state.action.jokersOwned[c] = [];
+            }
+            // If owned arrays are empty but jokersByColor has counts, rebuild.
+            const emptyAll = ALLOWED_COLORS.every(c => (room.state.action.jokersOwned[c].length === 0));
+            if (emptyAll && room.state.action.jokersByColor) {
+              for (const c of ALLOWED_COLORS) {
+                const set = room.state.action.jokersByColor[c] || {};
+                for (const t of ACTION_JOKER_TYPES) {
+                  const v = set[t];
+                  const n = (v===true) ? 1 : ((typeof v==="number" && isFinite(v)) ? Math.max(0, Math.floor(v)) : 0);
+                  for (let i=0;i<n;i++){
+                    room.state.action.jokersOwned[c].push({ type: t, color: c, source: "legacy", ts: Date.now() });
+                  }
+                }
+              }
+            }
+            syncJokerCountsFromOwned(room.state.action);
+          }
+        }catch(_e){}
       return true;
     }
   }catch(_e){}
@@ -437,12 +581,19 @@ function initGameState(room, activeColors, mode = "classic") {
   // Action state lives fully on the server (persisted in room.state).
   // Client UI only reads this snapshot.
   const action = (gameMode === "action") ? {
-    // Per color: each joker can be used exactly once per game
+    // Earned/base jokers live here (with origin color for display)
+    jokersOwned: {
+      red:    ACTION_JOKER_TYPES.map(t => ({ type: t, color: "red",    source: "base", ts: Date.now() })),
+      blue:   ACTION_JOKER_TYPES.map(t => ({ type: t, color: "blue",   source: "base", ts: Date.now() })),
+      green:  ACTION_JOKER_TYPES.map(t => ({ type: t, color: "green",  source: "base", ts: Date.now() })),
+      yellow: ACTION_JOKER_TYPES.map(t => ({ type: t, color: "yellow", source: "base", ts: Date.now() })),
+    },
+    // Backward compat snapshot for UI (counts)
     jokersByColor: {
-      red:      { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
-      blue:     { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
-      green:    { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
-      yellow:   { choose: true, sum: true, allColors: true, barricade: true, reroll: true, double: true },
+      red:      { choose: 1, sum: 1, allColors: 1, barricade: 1, reroll: 1, double: 1 },
+      blue:     { choose: 1, sum: 1, allColors: 1, barricade: 1, reroll: 1, double: 1 },
+      green:    { choose: 1, sum: 1, allColors: 1, barricade: 1, reroll: 1, double: 1 },
+      yellow:   { choose: 1, sum: 1, allColors: 1, barricade: 1, reroll: 1, double: 1 },
     },
     // Active effects for the CURRENT turn only (cleared on end_turn)
     effects: {
@@ -450,8 +601,8 @@ function initGameState(room, activeColors, mode = "classic") {
       barricadeBy: null,   // color that may move one barricade this turn
       doubleRoll: null,    // {kind:"choose"|"sum", by:"red", rolls:[..], chosen?:n }
     },
-    // version for future-proofing (optional)
-    v: 1,
+    // version for future-proofing
+    v: 2,
   } : null;
 
   room.state = {
@@ -947,30 +1098,34 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       }
 
       const turnColor = room.state.turnColor;
-      const set = room.state.action.jokersByColor?.[turnColor];
+      const action = room.state.action;
+      ensureActionJokers(action);
+      const set = action.jokersByColor?.[turnColor];
       if (!set) { send(ws, { type: "error", code: "NO_JOKERS", message: "Joker-Set fehlt" }); return; }
 
       const joker = String(msg.joker || "").toLowerCase().trim();
 
-      // helper: mark used
-      const markUsed = (k) => { if (set && set[k] === true) set[k] = false; };
+      // helper: count/consume (stackable)
+      const hasJoker = (k) => countOwnedJokers(action, turnColor, k) > 0;
+      const consumeNow = (k) => consumeOwnedJoker(action, turnColor, k);
+
 
       if (joker === "allcolors") {
-        if (set.allColors !== true) { send(ws, { type: "error", code: "USED", message: "Alle Farben Joker schon verbraucht" }); return; }
+        if (!hasJoker("allColors")) { send(ws, { type: "error", code: "USED", message: "Alle Farben Joker schon verbraucht" }); return; }
         // Wunsch: Joker erst NACH dem Würfeln (Phase need_move)
         if (room.state.phase !== "need_move" || room.state.rolled == null) {
           send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Joker wählen" });
           return;
         }
         room.state.action.effects.allColorsBy = turnColor;
-        markUsed("allColors");
+        consumeNow("allColors");
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "allcolors" });
         return;
       }
 
       if (joker === "barricade") {
-        if (set.barricade !== true) { send(ws, { type: "error", code: "USED", message: "Barikade Joker schon verbraucht" }); return; }
+        if (!hasJoker("barricade")) { send(ws, { type: "error", code: "USED", message: "Barikade Joker schon verbraucht" }); return; }
         // Barikade-Joker soll *vor* dem Würfeln eingesetzt werden.
         // Wenn man ihn nach dem Wurf aktiviert, kann der Spieler die Barikade nicht mehr bewegen
         // (weil das Spiel dann in phase=need_move ist) und es fühlt sich "buggy" an.
@@ -994,7 +1149,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
 
       if (joker === "reroll") {
-        if (set.reroll !== true) { send(ws, { type: "error", code: "USED", message: "Neu-Wurf Joker schon verbraucht" }); return; }
+        if (!hasJoker("reroll")) { send(ws, { type: "error", code: "USED", message: "Neu-Wurf Joker schon verbraucht" }); return; }
         // Neu-Wurf-Joker: erst NACH dem Würfeln (need_move) nutzbar
         if (room.state.phase !== "need_move" || room.state.rolled == null) {
           send(ws, { type: "error", code: "BAD_PHASE", message: "Erst würfeln – dann Neu-Wurf" });
@@ -1003,7 +1158,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         // Wurf verfällt -> zurück in need_roll
         room.state.rolled = null;
         room.state.phase = "need_roll";
-        markUsed("reroll");
+        consumeNow("reroll");
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "reroll" });
         return;
@@ -1011,7 +1166,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
       
       if (joker === "double") {
-        if (set.double !== true) { send(ws, { type: "error", code: "USED", message: "Doppelwurf Joker schon verbraucht" }); return; }
+        if (!hasJoker("double")) { send(ws, { type: "error", code: "USED", message: "Doppelwurf Joker schon verbraucht" }); return; }
         // Doppelwurf-Joker soll *vor* dem Würfeln eingesetzt werden.
         if (room.state.phase !== "need_roll" || room.state.rolled != null) {
           send(ws, { type: "error", code: "BAD_PHASE", message: "Doppelwurf nur vor dem Würfeln" });
@@ -1023,7 +1178,7 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
           return;
         }
         room.state.action.effects.doubleRoll = { kind: "sum2", by: turnColor, pending: true, rolls: null, chosen: null };
-        markUsed("double");
+        consumeNow("double");
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "double" });
         return;
@@ -1078,8 +1233,8 @@ if (joker === "choose" || joker === "sum") {
 
       // Commit: Joker jetzt verbrauchen (erst nach erfolgreichem Move)
       try{
-        if (room.state.action && room.state.action.jokersByColor && room.state.action.jokersByColor[turnColor]) {
-          room.state.action.jokersByColor[turnColor].barricade = false;
+        if (room.state.action) {
+          consumeOwnedJoker(room.state.action, turnColor, "barricade");
         }
       }catch(_e){}
       await persistRoomState(room);
@@ -1277,33 +1432,45 @@ if (msg.type === "move_request") {
 
 
 
-      // Wheel: if a piece is kicked in Action-Mode, the kicked color gets a 50% chance to receive a random joker.
+      // Wheel: if a piece is kicked in Action-Mode, the ACTIVE (current) player gets a 50% chance
+      // to receive a random joker. The joker "origin color" is the kicked piece color (for UI display).
       // Server decides instantly (no delays). Client may animate it visually.
       let wheel = null;
       try {
         const isAction = String(room.state.mode || "classic") === "action";
-        const jb = room.state?.action?.jokersByColor;
-        if (isAction && jb && kicked.length) {
+        const action = room.state?.action;
+        if (isAction && action && kicked.length) {
+          ensureActionJokers(action);
+
+          // Determine which colors were kicked (usually 1)
           const kickedColors = new Set();
           for (const pid of kicked) {
             const pp = room.state.pieces.find(x => String(x.id) === String(pid));
             if (pp && pp.color) kickedColors.add(pp.color);
           }
+
           const segments = ["allColors", "none", "barricade", "none", "reroll", "none", "double", "none"]; // 50% none
           wheel = [];
+
           for (const kc of kickedColors) {
             const pick = segments[Math.floor(Math.random() * segments.length)];
             const result = (pick === "none") ? null : pick;
-            wheel.push({ targetColor: kc, result, durationMs: 10000 });
+
+            wheel.push({ ownerColor: activeColor, jokerColor: kc, result, durationMs: 10000 });
+
+            // Grant to ACTIVE player; store origin color=kc for display.
             if (result) {
-              if (!jb[kc]) jb[kc] = {};
-              jb[kc][result] = true; // grant as "extra" even if previously used
+              addOwnedJoker(action, activeColor, result, kc, "wheel");
             }
           }
+
+          // Keep counts snapshot in sync
+          syncJokerCountsFromOwned(action);
         }
       } catch (_e) {
         wheel = null;
       }
+
       // landed on barricade?
       const barricades = room.state.barricades;
       const idx = barricades.indexOf(landed);
