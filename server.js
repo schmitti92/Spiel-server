@@ -512,7 +512,7 @@ function assignColorsRandom(room) {
 }
 
 /** ---------- Game state ---------- **/
-function initGameState(room, activeColors, mode = "classic") {
+function initGameState(room, activeColors, mode = "classic", starterColor = null) {
   // Normalize activeColors (colors that are actually participating in turn order).
   activeColors = Array.isArray(activeColors) && activeColors.length
     ? activeColors.map(c => String(c).toLowerCase())
@@ -567,8 +567,9 @@ function initGameState(room, activeColors, mode = "classic") {
   // Fallback: mindestens 2 Farben erzwingen (damit Turn-Cycle nicht kaputt geht)
   const active = (act.length >= 2) ? act : ALLOWED_COLORS.slice(0, 2);
 
-  // choose starter (deterministic-ish: first active color)
-  const turnColor = active[0] || "red";
+  // choose starter
+  const sc = String(starterColor || "").toLowerCase().trim();
+  const turnColor = (sc && active.includes(sc)) ? sc : (active[0] || "red");
 
   room.lastRollWasSix = false;
   // IMPORTANT: carrying must survive restart -> store in room.state (persisted)
@@ -1024,6 +1025,32 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
     }
 
     // ---------- START / RESET ----------
+
+    if (msg.type === "start_request") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann starten" }); return; }
+      if (!canStart(room)) { send(ws, { type: "error", code: "NEED_2P", message: "Mindestens 2 Spieler nötig" }); return; }
+
+      // aktive Farben anhand verbundener Spieler (mit gewählter Farbe)
+      const act = Array.from(room.players.values())
+        .filter(p => isConnectedPlayer(p) && ALLOWED_COLORS.includes(p.color))
+        .map(p => p.color);
+      const uniqueAct = ALLOWED_COLORS.filter(c => act.includes(c));
+      if (uniqueAct.length < 2) {
+        send(ws, { type: "error", code: "NEED_COLORS", message: "Mindestens 2 Spieler müssen eine Farbe wählen" });
+        return;
+      }
+
+      // Server entscheidet zufällig die Startfarbe (Quelle der Wahrheit)
+      const starterColor = uniqueAct[Math.floor(Math.random() * uniqueAct.length)];
+
+      // pending info (nur im RAM, kein Persist nötig)
+      room._pendingStart = { starterColor, mode: (msg.mode || "classic"), ts: Date.now() };
+
+      broadcast(room, { type: "start_spin", activeColors: uniqueAct, starterColor, mode: (msg.mode || "classic"), durationMs: 4200 });
+      return;
+    }
+
     if (msg.type === "start") {
       const me = room.players.get(clientId);
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann starten" }); return; }
@@ -1039,7 +1066,9 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
         return;
       }
 
-      initGameState(room, uniqueAct, msg.mode || "classic");
+      const starter = String(msg.starterColor || room._pendingStart?.starterColor || "").toLowerCase().trim();
+      initGameState(room, uniqueAct, msg.mode || "classic", starter);
+      room._pendingStart = null;
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
       broadcast(room, { type: "started", state: room.state });
