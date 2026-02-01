@@ -1036,7 +1036,6 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
     if (msg.type === "set_award_mode") {
       const me = room.players.get(clientId);
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann den Modus ändern" }); return; }
-      if (room.state && room.state.started) { send(ws, { type: "error", code: "MODE_LOCKED", message: "Joker-Modus nur vor Spielstart änderbar" }); return; }
 
       const mode = (msg.mode === "victim") ? "victim" : "thrower";
       room.jokerAwardMode = mode;
