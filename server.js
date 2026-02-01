@@ -405,6 +405,9 @@ function makeRoom(code) {
     // Backward-compat field. Source of truth is room.state.carryingByColor
     // because only room.state is persisted to disk/Firebase.
     carryingByColor: { red: false, blue: false, green: false, yellow: false },
+    // Joker wheel rule: who receives a joker when a piece is kicked in Action-Mode wheel
+    // "ATTACKER" = active player (who kicked) receives; "VICTIM" = kicked color receives
+    jokerRule: "ATTACKER",
   };
 }
 
@@ -455,6 +458,10 @@ function resumeIfReady(room) {
 
 
 function broadcast(room, obj) {
+  // Inject current lobby settings (safe to ignore on older clients)
+  if (obj && typeof obj === "object" && !Array.isArray(obj) && obj.jokerRule == null) {
+    obj.jokerRule = room?.jokerRule || "ATTACKER";
+  }
   const msg = JSON.stringify(obj);
 
   // Hotfix: broadcast to currently connected sockets in this room.
@@ -948,6 +955,18 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
     if (!room) return;
     // hotfix: ensure per-room ws map exists (prevents crashes)
     if (!room.clients || !(room.clients instanceof Map)) room.clients = new Map();
+
+
+    // ---------- LOBBY SETTING: Joker wheel rule (host-only, before start) ----------
+    if (msg.type === "set_joker_rule") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann die Joker-Regel ändern" }); return; }
+      if (room.state && room.state.started) { send(ws, { type: "error", code: "ALREADY_STARTED", message: "Nach Spielstart nicht mehr änderbar" }); return; }
+      const rule = String(msg.rule || "").toUpperCase();
+      room.jokerRule = (rule === "VICTIM") ? "VICTIM" : "ATTACKER";
+      broadcast(room, { type: "joker_rule", rule: room.jokerRule });
+      return;
+    }
 
     if (msg.type === "leave") {
       room.players.delete(clientId);
@@ -1485,11 +1504,13 @@ if (msg.type === "move_request") {
             const pick = segments[Math.floor(Math.random() * segments.length)];
             const result = (pick === "none") ? null : pick;
 
-            wheel.push({ ownerColor: activeColor, jokerColor: kc, result, durationMs: 10000 });
+            const receiverColor = (String(room.jokerRule || "ATTACKER") === "VICTIM") ? kc : activeColor;
 
-            // Grant to ACTIVE player; store origin color=kc for display.
+            wheel.push({ ownerColor: receiverColor, jokerColor: kc, result, durationMs: 10000 });
+
+            // Grant according to rule; store origin color=kc for display.
             if (result) {
-              addOwnedJoker(action, activeColor, result, kc, "wheel");
+              addOwnedJoker(action, receiverColor, result, kc, "wheel");
             }
           }
 
