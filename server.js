@@ -615,6 +615,9 @@ function initGameState(room, activeColors, mode = "classic", starterColor = null
   room.state = {
     started: true,
     paused: false,
+    finished: false,
+    winnerColor: null,
+    finishedAt: null,
     mode: gameMode,
     jokerAwardMode: (room.state && room.state.jokerAwardMode) ? room.state.jokerAwardMode : (room.jokerAwardMode || "thrower"),
     action,
@@ -627,6 +630,26 @@ function initGameState(room, activeColors, mode = "classic", starterColor = null
     carryingByColor,
     activeColors: active,
   };
+}
+
+function detectWinnerColor(room) {
+  const goalId = room?.state?.goal || GOAL;
+  if (!goalId) return null;
+  const pcs = room?.state?.pieces;
+  if (!Array.isArray(pcs)) return null;
+  for (const p of pcs) {
+    if (p && p.posKind === "board" && p.nodeId === goalId) return p.color || null;
+  }
+  return null;
+}
+
+function setGameOver(room, winnerColor) {
+  if (!room || !room.state) return;
+  if (room.state.finished) return;
+  room.state.finished = true;
+  room.state.winnerColor = String(winnerColor || "").toLowerCase() || null;
+  room.state.finishedAt = Date.now();
+  room.state.phase = "game_over";
 }
 
 function nextTurnColor(room, current) {
@@ -782,6 +805,10 @@ function requireRoomState(room, ws) {
 function requireTurn(room, clientId, ws) {
   const me = room.players.get(clientId);
   if (!me?.color) { send(ws, { type: "error", code: "SPECTATOR", message: "Du hast keine Farbe" }); return false; }
+  if (room.state?.finished) {
+    send(ws, { type: "error", code: "GAME_OVER", message: `Spiel beendet. Gewinner: ${(room.state.winnerColor || "?").toUpperCase()}` });
+    return false;
+  }
   if (room.state.paused) { send(ws, { type: "error", code: "PAUSED", message: "Spiel pausiert" }); return false; }
   if (room.state.turnColor !== me.color) {
     send(ws, { type: "error", code: "NOT_YOUR_TURN", message: `Nicht dran. Dran: ${room.state.turnColor.toUpperCase()}` });
@@ -1563,6 +1590,13 @@ if (msg.type === "move_request") {
         }
       }
 
+      // ✅ Win condition (server is chef): first piece that reaches the goal node wins.
+      const winner = detectWinnerColor(room);
+      if (winner) {
+        setGameOver(room, winner);
+        console.log(`[win] room=${room.code} winner=${room.state.winnerColor}`);
+      }
+
       console.log(`[move] room=${room.code} active=${activeColor} moved=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
       broadcast(room, {
         type: "move",
@@ -1570,6 +1604,9 @@ if (msg.type === "move_request") {
         wheel: wheel || undefined,
         state: room.state
       });
+      if (room.state.finished) {
+        broadcast(room, { type: "game_over", winnerColor: room.state.winnerColor, finishedAt: room.state.finishedAt });
+      }
       // Persist after every successful move so a server restart has the newest possible state.
       await persistRoomState(room);
       return;
