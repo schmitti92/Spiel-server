@@ -349,10 +349,52 @@ const clients = new Map(); // clientId -> {ws, room, name, sessionToken}
 const rooms = new Map();   // code -> room
 
 const app = express();
+
+// CORS for GitHub Pages / mobile browsers (stats/presence endpoints).
+// NOTE: WebSocket is unchanged; this only affects HTTP requests.
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  if (req.method === "OPTIONS") return res.status(204).end();
+  next();
+});
+app.use(express.json({ limit: "200kb" }));
 app.get("/", (_req, res) => res.status(200).send("barikade-server ok"));
 app.get("/health", (_req, res) =>
   res.status(200).json({ ok: true, ts: Date.now(), rooms: rooms.size, clients: clients.size })
 );
+
+
+// --- Room presence (Lobby) ---
+// Returns current players list for a room (no join, read-only).
+app.get("/room/:code", (req, res) => {
+  try {
+    const code = String(req.params.code || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 20);
+    if (!code) return res.status(400).json({ ok: false, error: "NO_CODE" });
+    const room = rooms.get(code);
+    if (!room) return res.status(404).json({ ok: false, error: "NO_ROOM" });
+    return res.status(200).json({ ok: true, ...roomUpdatePayload(room) });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "ERR" });
+  }
+});
+
+// Ensures the room exists (host can create the room before anyone opens the game).
+app.post("/room/:code/ensure", (req, res) => {
+  try {
+    const code = String(req.params.code || "").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 20);
+    if (!code) return res.status(400).json({ ok: false, error: "NO_CODE" });
+    let room = rooms.get(code);
+    if (!room) {
+      room = makeRoom(code);
+      rooms.set(code, room);
+    }
+    return res.status(200).json({ ok: true, code, rooms: rooms.size });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "ERR" });
+  }
+});
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
