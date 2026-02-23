@@ -120,11 +120,6 @@ function roomUpdatePayload(room, playersOverride) {
 // Firebase is an additional, durable persistence layer.
 const FIREBASE_ENABLED = String(process.env.FIREBASE_ENABLED || "").trim() === "1";
 const FIREBASE_COLLECTION = process.env.FIREBASE_COLLECTION || "rooms";
-const STATS_ENABLED = String(process.env.STATS_ENABLED || "").trim() === "1";
-const STATS_PLAYERS_COLLECTION = process.env.STATS_PLAYERS_COLLECTION || "barikadePlayers";
-const STATS_GLOBAL_DOC = process.env.STATS_GLOBAL_DOC || "global";
-const STATS_GLOBAL_COLLECTION = process.env.STATS_GLOBAL_COLLECTION || "barikadeStats";
-const STATS_MATCHES_COLLECTION = process.env.STATS_MATCHES_COLLECTION || "barikadeMatches";
 
 let firestore = null;
 
@@ -174,229 +169,98 @@ function docIdForRoom(code) {
     .toUpperCase()
     .replace(/[^A-Z0-9_-]/g, "")
     .slice(0, 20) || "ROOM";
-
-// ---------- Barikade Stats (server-chef, Firebase) ----------
-// We record roll counts/sums DURING the match (persisted in room.state),
-// so reconnect/restart does NOT lose statistics.
-// Aggregated lifetime stats are written once when a match finishes.
-//
-// Stats are only active when both FIREBASE_ENABLED=1 and STATS_ENABLED=1.
-
-const CANONICAL_NAMES = ["David","Vanessa","Christoph"]; // "Gast" is ignored for lifetime stats
-
-function normalizeNameKey(name){
-  const n = String(name || "").trim().toLowerCase();
-  if(!n) return null;
-  if(n === "david") return "David";
-  if(n === "vanessa") return "Vanessa";
-  if(n === "christoph") return "Christoph";
-  if(n === "gast" || n === "guest") return "Gast";
-  return null;
 }
 
-function ensureMatchStats(room){
+
+// ---------- Lobby Reservations (Name + Color Pre-Join) ----------
+// Goal:
+// - In the name-selection mask, show who already clicked a name ("ready") and who is already in-game.
+// - Lock selected colors immediately for others.
+// - Purely additive: does NOT change gameplay rules.
+const LOBBY_TTL_MS = Number(process.env.LOBBY_TTL_MS || (30 * 60 * 1000)); // default 30 min
+
+function nowMs(){ return Date.now(); }
+
+function normalizeRoomCode(code){
+  return String(code||"").trim().toUpperCase().replace(/[^A-Z0-9_-]/g, "").slice(0, 20);
+}
+
+function ensureLobby(room){
+  if(!room) return;
+  if(!room.lobby || typeof room.lobby !== "object") room.lobby = { reservations:{}, colorLocks:{} };
+  if(!room.lobby.reservations || typeof room.lobby.reservations !== "object") room.lobby.reservations = {};
+  if(!room.lobby.colorLocks || typeof room.lobby.colorLocks !== "object") room.lobby.colorLocks = {};
+}
+
+function lobbyCleanup(room){
   try{
-    if(!room?.state) return;
-    if(!room.state.matchStats || typeof room.state.matchStats !== "object"){
-      room.state.matchStats = {
-        startedAt: Date.now(),
-        rollsByName: { David:{count:0,sum:0}, Vanessa:{count:0,sum:0}, Christoph:{count:0,sum:0}, Gast:{count:0,sum:0} },
-        participants: [], // canonical name keys seen in this match
-        matchId: null,
-        counted: false,
-        winnerName: null,
-        finishedAt: null,
-        durationMs: null,
-      };
-    }
-    const ms = room.state.matchStats;
-    if(typeof ms.startedAt !== "number") ms.startedAt = Date.now();
-    if(!ms.rollsByName || typeof ms.rollsByName !== "object"){
-      ms.rollsByName = { David:{count:0,sum:0}, Vanessa:{count:0,sum:0}, Christoph:{count:0,sum:0}, Gast:{count:0,sum:0} };
-    } else {
-      for(const k of ["David","Vanessa","Christoph","Gast"]){
-        if(!ms.rollsByName[k] || typeof ms.rollsByName[k] !== "object") ms.rollsByName[k] = {count:0,sum:0};
-        const c = ms.rollsByName[k].count;
-        const s = ms.rollsByName[k].sum;
-        ms.rollsByName[k].count = (typeof c === "number" && isFinite(c)) ? Math.max(0, Math.floor(c)) : 0;
-        ms.rollsByName[k].sum = (typeof s === "number" && isFinite(s)) ? Math.max(0, Math.floor(s)) : 0;
+    ensureLobby(room);
+    const t = nowMs();
+    for(const [nameKey, r] of Object.entries(room.lobby.reservations)){
+      if(!r || typeof r !== "object"){ delete room.lobby.reservations[nameKey]; continue; }
+      const ts = Number(r.ts||0);
+      if(ts && (t - ts) > LOBBY_TTL_MS){
+        // release color lock
+        const c = String(r.color||"").toLowerCase();
+        if(c && room.lobby.colorLocks[c] === nameKey) delete room.lobby.colorLocks[c];
+        delete room.lobby.reservations[nameKey];
       }
     }
-    if(!Array.isArray(ms.participants)) ms.participants = [];
-    if(ms.matchId == null) ms.matchId = null;
-    if(typeof ms.counted !== "boolean") ms.counted = false;
+    // remove stale colorLocks that point to missing reservation
+    for(const [c, nameKey] of Object.entries(room.lobby.colorLocks)){
+      if(!room.lobby.reservations[nameKey]) delete room.lobby.colorLocks[c];
+    }
   }catch(_e){}
 }
 
-function recordRollForStats(room, playerName, rollValue){
-  try{
-    if(!room?.state) return;
-    ensureMatchStats(room);
-    const key = normalizeNameKey(playerName) || "Gast";
-    const v = Number(rollValue);
-    if(!(v >= 1 && v <= 12)) return;
-
-    const ms = room.state.matchStats;
-    if(!ms.rollsByName[key]) ms.rollsByName[key] = {count:0,sum:0};
-    ms.rollsByName[key].count += 1;
-    ms.rollsByName[key].sum += v;
-
-    if(key && !ms.participants.includes(key)) ms.participants.push(key);
-  }catch(_e){}
+function lobbySnapshot(room){
+  ensureLobby(room);
+  lobbyCleanup(room);
+  return {
+    reservations: room.lobby.reservations,
+    colorLocks: room.lobby.colorLocks,
+    ts: nowMs()
+  };
 }
 
-function matchIdFor(room){
-  ensureMatchStats(room);
-  const ms = room.state.matchStats;
-  const base = docIdForRoom(room.code);
-  const start = String(ms.startedAt || Date.now());
-  return `${base}_${start}`;
-}
+function reserveLobby(room, nameKey, color, status){
+  ensureLobby(room);
+  lobbyCleanup(room);
+  const nk = String(nameKey||"").trim();
+  if(!nk) return { ok:false, error:"NO_NAME" };
+  const c = ALLOWED_COLORS.includes(String(color||"").toLowerCase()) ? String(color).toLowerCase() : null;
+  const st = (status === "in_game") ? "in_game" : "lobby";
 
-async function writeLiveMatchStats(room){
-  // Persisted automatically by persistRoomState (room.state), but we also write a lightweight match doc.
-  try{
-    if(!FIREBASE_ENABLED || !STATS_ENABLED) return;
-    initFirebaseIfConfigured();
-    if(!firestore || !room?.code || !room?.state) return;
-
-    ensureMatchStats(room);
-    const ms = room.state.matchStats;
-    const matchId = ms.matchId || matchIdFor(room);
-    ms.matchId = matchId;
-
-    const doc = firestore.collection(STATS_MATCHES_COLLECTION).doc(matchId);
-    const payload = {
-      room: room.code,
-      matchId,
-      status: room.state.finished ? "finished" : "running",
-      startedAt: ms.startedAt,
-      finishedAt: room.state.finishedAt || ms.finishedAt || null,
-      winnerColor: room.state.winnerColor || null,
-      winnerName: ms.winnerName || null,
-      rollsByName: ms.rollsByName,
-      participants: ms.participants,
-      mode: room.state.mode || "classic",
-      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-    };
-    await doc.set(payload, { merge: true });
-  }catch(e){
-    console.warn("[stats] live match write failed:", e?.message || e);
-  }
-}
-
-async function finalizeMatchStatsIfNeeded(room){
-  try{
-    if(!FIREBASE_ENABLED || !STATS_ENABLED) return;
-    initFirebaseIfConfigured();
-    if(!firestore || !room?.state?.finished) return;
-
-    ensureMatchStats(room);
-    const ms = room.state.matchStats;
-
-    // Determine winnerName from current player owning winnerColor
-    const wcol = String(room.state.winnerColor || "").toLowerCase();
-    let winnerName = null;
-    if(wcol){
-      for(const p of room.players.values()){
-        if(String(p?.color||"").toLowerCase() === wcol){
-          winnerName = normalizeNameKey(p?.name) || p?.name || null;
-          break;
-        }
+  // enforce unique color lock (if requested)
+  if(c){
+    const currentHolder = room.lobby.colorLocks[c];
+    if(currentHolder && currentHolder !== nk){
+      // If current holder is stale (not reserved anymore), allow
+      if(!room.lobby.reservations[currentHolder]){
+        delete room.lobby.colorLocks[c];
+      } else {
+        return { ok:false, error:"COLOR_TAKEN", holder: currentHolder };
       }
     }
-    ms.winnerName = winnerName || ms.winnerName || null;
-    ms.finishedAt = room.state.finishedAt || ms.finishedAt || Date.now();
-    ms.durationMs = Math.max(0, (ms.finishedAt||0) - (ms.startedAt||0));
-
-    const matchId = ms.matchId || matchIdFor(room);
-    ms.matchId = matchId;
-
-    const matchRef = firestore.collection(STATS_MATCHES_COLLECTION).doc(matchId);
-    const globalRef = firestore.collection(STATS_GLOBAL_COLLECTION).doc(STATS_GLOBAL_DOC);
-
-    await firestore.runTransaction(async (tx) => {
-      const matchSnap = await tx.get(matchRef);
-      const alreadyCounted = matchSnap.exists && matchSnap.data()?.counted === true;
-      if(alreadyCounted || ms.counted) {
-        // Still update match doc details
-        tx.set(matchRef, {
-          room: room.code,
-          matchId,
-          status: "finished",
-          counted: true,
-          startedAt: ms.startedAt,
-          finishedAt: ms.finishedAt,
-          durationMs: ms.durationMs,
-          winnerColor: room.state.winnerColor || null,
-          winnerName: ms.winnerName || null,
-          rollsByName: ms.rollsByName,
-          participants: ms.participants,
-          mode: room.state.mode || "classic",
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-        return;
-      }
-
-      // Count this match exactly once
-      const gSnap = await tx.get(globalRef);
-      const g = gSnap.exists ? gSnap.data() : {};
-      const totalGames = Number(g?.totalGames || 0) || 0;
-      const totalPlayTimeMs = Number(g?.totalPlayTimeMs || 0) || 0;
-
-      tx.set(globalRef, {
-        totalGames: totalGames + 1,
-        totalPlayTimeMs: totalPlayTimeMs + (ms.durationMs || 0),
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-
-      // Per-player aggregates (ignore Gast)
-      for(const nameKey of CANONICAL_NAMES){
-        const r = ms.rollsByName?.[nameKey] || {count:0,sum:0};
-        const pRef = firestore.collection(STATS_PLAYERS_COLLECTION).doc(nameKey.toLowerCase());
-        const pSnap = await tx.get(pRef);
-        const p = pSnap.exists ? pSnap.data() : {};
-        const games = Number(p?.games || 0) || 0;
-        const wins = Number(p?.wins || 0) || 0;
-        const rollCount = Number(p?.rollCount || 0) || 0;
-        const rollSum = Number(p?.rollSum || 0) || 0;
-        const playTimeMs = Number(p?.playTimeMs || 0) || 0;
-        const addWin = (ms.winnerName && normalizeNameKey(ms.winnerName) === nameKey) ? 1 : 0;
-        tx.set(pRef, {
-          name: nameKey,
-          games: games + 1,
-          wins: wins + addWin,
-          rollCount: rollCount + (Number(r.count)||0),
-          rollSum: rollSum + (Number(r.sum)||0),
-          playTimeMs: playTimeMs + (ms.durationMs || 0),
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-        }, { merge: true });
-      }
-
-      // Mark match counted
-      tx.set(matchRef, {
-        room: room.code,
-        matchId,
-        status: "finished",
-        counted: true,
-        startedAt: ms.startedAt,
-        finishedAt: ms.finishedAt,
-        durationMs: ms.durationMs,
-        winnerColor: room.state.winnerColor || null,
-        winnerName: ms.winnerName || null,
-        rollsByName: ms.rollsByName,
-        participants: ms.participants,
-        mode: room.state.mode || "classic",
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, { merge: true });
-    });
-
-    ms.counted = true;
-  }catch(e){
-    console.warn("[stats] finalize failed:", e?.message || e);
   }
+
+  // update reservation
+  const prev = room.lobby.reservations[nk] || null;
+  // if changing color, release previous lock
+  if(prev && prev.color && prev.color !== c){
+    const pc = String(prev.color).toLowerCase();
+    if(room.lobby.colorLocks[pc] === nk) delete room.lobby.colorLocks[pc];
+  }
+
+  room.lobby.reservations[nk] = { ts: nowMs(), color: c, status: st };
+  if(c) room.lobby.colorLocks[c] = nk;
+  return { ok:true };
 }
-}
+
+// ---------- Match Stats safety guard ----------
+// Some deployed versions call ensureMatchStats() during initGameState.
+// If stats are not enabled in this build, we keep a safe no-op to avoid crashes.
+function ensureMatchStats(_room){ /* no-op unless stats module is present */ }
 
 // ---------- Save / Restore (best-effort) ----------
 // NOTE: On some hosts (z.B. Render free) kann das Dateisystem nach Restart leer sein.
@@ -621,48 +485,42 @@ app.post("/room/:code/ensure", (req, res) => {
   } catch (e) {
     return res.status(500).json({ ok: false, error: "ERR" });
   }
+});
 
-// --- Lifetime statistics (Lobby) ---
-// Returns aggregated lifetime statistics from Firestore.
-// Requires FIREBASE_ENABLED=1 and STATS_ENABLED=1.
-app.get("/api/barikade/stats", async (_req, res) => {
+// --- Lobby presence/reservations (pre-join) ---
+// Lets the lobby show: who clicked a name (ready) and which colors are locked.
+app.get("/room/:code/presence", (req, res) => {
   try{
-    if(!FIREBASE_ENABLED || !STATS_ENABLED){
-      return res.status(200).json({ ok:true, enabled:false, players:{}, global:{ totalGames:0, totalPlayTimeMs:0 } });
-    }
-    initFirebaseIfConfigured();
-    if(!firestore){
-      return res.status(200).json({ ok:true, enabled:false, players:{}, global:{ totalGames:0, totalPlayTimeMs:0 } });
-    }
-
-    const globalRef = firestore.collection(STATS_GLOBAL_COLLECTION).doc(STATS_GLOBAL_DOC);
-    const gSnap = await globalRef.get();
-    const g = gSnap.exists ? gSnap.data() : {};
-    const global = {
-      totalGames: Number(g?.totalGames || 0) || 0,
-      totalPlayTimeMs: Number(g?.totalPlayTimeMs || 0) || 0,
-    };
-
-    const players = {};
-    for(const nameKey of CANONICAL_NAMES){
-      const docId = nameKey.toLowerCase();
-      const pSnap = await firestore.collection(STATS_PLAYERS_COLLECTION).doc(docId).get();
-      const p = pSnap.exists ? pSnap.data() : {};
-      players[nameKey] = {
-        games: Number(p?.games || 0) || 0,
-        wins: Number(p?.wins || 0) || 0,
-        rollCount: Number(p?.rollCount || 0) || 0,
-        rollSum: Number(p?.rollSum || 0) || 0,
-        playTimeMs: Number(p?.playTimeMs || 0) || 0,
-      };
-    }
-
-    return res.status(200).json({ ok:true, enabled:true, players, global });
-  }catch(e){
-    return res.status(500).json({ ok:false, enabled:false, error:"ERR" });
+    const code = normalizeRoomCode(req.params.code);
+    if(!code) return res.status(400).json({ ok:false, error:"NO_CODE" });
+    const room = rooms.get(code);
+    if(!room) return res.status(404).json({ ok:false, error:"NO_ROOM" });
+    return res.status(200).json({ ok:true, code, ...lobbySnapshot(room), players: currentPlayersList(room) });
+  }catch(_e){
+    return res.status(500).json({ ok:false, error:"ERR" });
   }
 });
+
+app.post("/room/:code/reserve", (req, res) => {
+  try{
+    const code = normalizeRoomCode(req.params.code);
+    if(!code) return res.status(400).json({ ok:false, error:"NO_CODE" });
+    const room = rooms.get(code);
+    if(!room) return res.status(404).json({ ok:false, error:"NO_ROOM" });
+
+    const nameKey = String(req.body?.nameKey || req.body?.name || "").trim();
+    const color = String(req.body?.color || "").toLowerCase().trim();
+    const status = String(req.body?.status || "lobby").trim();
+
+    const r = reserveLobby(room, nameKey, color, status);
+    if(!r.ok) return res.status(409).json({ ok:false, ...r });
+
+    return res.status(200).json({ ok:true, code, ...lobbySnapshot(room) });
+  }catch(_e){
+    return res.status(500).json({ ok:false, error:"ERR" });
+  }
 });
+
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -711,6 +569,7 @@ function uid() {
 function makeRoom(code) {
   return {
     code,
+    lobby: { reservations: {}, colorLocks: {} },
     hostToken: null, // stable host identity (sessionToken)
     // Socket index for this room (used for host-swap/reconnect messaging)
     clients: new Map(), // clientId -> ws
@@ -940,8 +799,6 @@ function initGameState(room, activeColors, mode = "classic", starterColor = null
     carryingByColor,
     activeColors: active,
   };
-  // init per-match statistics (persisted with state)
-  ensureMatchStats(room);
 }
 
 function detectWinnerColor(room) {
@@ -1270,6 +1127,15 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 	      // keep per-room socket map in sync (host-swap/reconnect depends on it)
 	      room.clients.set(clientId, ws);
 
+// Lobby presence: mark name as in_game and lock chosen color (if any)
+try{
+  ensureLobby(room);
+  const nk = typeof normalizeNameKey === "function" ? (normalizeNameKey(name) || name) : name;
+  // only lock canonical names + Gast if provided
+  reserveLobby(room, nk, color, "in_game");
+}catch(_e){}
+
+
       // Reconnect-Sicherheit: Wenn noch nicht wieder 2 Spieler verbunden sind,
       // pausieren wir den Raum sofort (auch nach Server-Restart/Restore).
       if (room.state) {
@@ -1284,9 +1150,6 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
 
 
       if (room.state) send(ws, { type: "snapshot", state: room.state });
-
-      // If a finished match was not counted due to a crash/restart, try to finalize now.
-      try{ await finalizeMatchStatsIfNeeded(room); }catch(_e){}
       return;
     }
 
@@ -1368,7 +1231,13 @@ room.players.set(clientId, { id: clientId, name, color, isHost, sessionToken, la
       // assign
       me.color = targetColor;
 
-      broadcast(room, roomUpdatePayload(room));
+      
+
+// Also lock the color in lobby reservations so other devices see it immediately.
+try{
+  reserveLobby(room, typeof normalizeNameKey === "function" ? (normalizeNameKey(me.name) || me.name) : me.name, targetColor, "lobby");
+}catch(_e){}
+broadcast(room, roomUpdatePayload(room));
       await persistRoomState(room);
       return;
     }
@@ -1670,13 +1539,6 @@ if (joker === "choose" || joker === "sum") {
 
       console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
 
-      // Live stats: record every roll on the server (reconnect-safe)
-      try{
-        const me = room.players.get(clientId);
-        recordRollForStats(room, me?.name, v);
-        await writeLiveMatchStats(room);
-      }catch(_e){}
-
       room.state.rolled = v;
       room.lastRollWasSix = (v === 6);
       room.state.phase = "need_move";
@@ -1917,9 +1779,6 @@ if (msg.type === "move_request") {
       if (winner) {
         setGameOver(room, winner);
         console.log(`[win] room=${room.code} winner=${room.state.winnerColor}`);
-        // Live match doc + finalize lifetime stats (idempotent)
-        try{ await writeLiveMatchStats(room); }catch(_e){}
-        try{ await finalizeMatchStatsIfNeeded(room); }catch(_e){}
       }
 
       console.log(`[move] room=${room.code} active=${activeColor} moved=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
