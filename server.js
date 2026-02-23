@@ -17,6 +17,41 @@ const PORT = process.env.PORT || 10000;
 // im Match verwendeten Farben). Pieces existieren aber immer für alle 4 Farben.
 const ALLOWED_COLORS = ["red", "blue", "green", "yellow"];
 
+// ---------- Wheel Quotes (Kick) ----------
+const KICK_QUOTES = [
+  "Abflug! Sitzplatz gibt's draussen.",
+  "Raus mit dir – das ist Barikade, kein Wellnessurlaub!",
+  "Zack! Das war ein Kurztrip ins Aus.",
+  "Du wolltest Action? Bitte sehr.",
+  "Heute gibt’s keinen Rabatt auf Schadenfreude.",
+  "Einmal frische Luft fuers Karma!",
+  "Und tschues – wir sehen uns am Startfeld!",
+  "Der Wurf war gut… fuer mich. Schlecht fuer dich.",
+  "Das Brett ist voll – einer muss gehen.",
+  "Gerade noch drin, jetzt schon draussen.",
+  "Das war kein Schritt, das war ein Rausschmiss.",
+  "Kleiner Ausflug? Nein: grosser Rauswurf.",
+  "Hier fliegen Figuren schneller als Ausreden.",
+  "Wenn’s kracht, dann richtig!",
+  "Barikade sagt: Bitte hinten anstellen – draussen.",
+  "Du bist nicht raus… du bist nur woanders.",
+  "Einmal Kick to go.",
+  "Auf Wiedersehen im Rueckspiegel!",
+  "Das Spielfeld hat gesprochen.",
+  "Heute ist nicht dein Tag – heute ist meiner!",
+  "Ich nenn das: taktische Luftnummer.",
+  "Sorry, Regeln sind Regeln – und ich bin Chef.",
+  "Gute Reise! Nicht vergessen: Rueckflug erst spaeter.",
+  "Bumm. Und weg war sie/er.",
+  "Das ist kein Bug – das ist Barikade.",
+  "Wenn du fällst, dann stilvoll.",
+  "Ich schubs nur… der Rest macht die Physik.",
+  "Kopf hoch – Startfeld ist auch schoen.",
+  "Aus dem Weg, ich hab Ziele!",
+  "Schnelltest: raus oder raus? Ergebnis: raus."
+];
+
+
 // ---------- Action-Mode Joker Stacks (v2) ----------
 // We keep the existing action.jokersByColor for backwards compatibility,
 // but internally we store earned/base jokers as arrays with an "origin color".
@@ -1711,7 +1746,7 @@ if (msg.type === "move_request") {
             if (pp && pp.color) kickedColors.add(pp.color);
           }
 
-          const segments = ["allColors","barricade","reroll","double"]; // 50% none
+          const segments = ["allColors","barricade","reroll","double"]; // keine Nieten
           wheel = [];
 
           for (const kc of kickedColors) {
@@ -1722,7 +1757,10 @@ if (msg.type === "move_request") {
             const targetColor = (awardMode === "victim") ? kc : activeColor;
 
             // Keep both keys for backwards/forwards compatibility (client may read either).
-            wheel.push({ ownerColor: targetColor, targetColor, jokerColor: kc, result, durationMs: 10000 });
+            const attacker = Array.from(room.players.values()).find(p=>p && p.color===targetColor);
+            const victim = Array.from(room.players.values()).find(p=>p && p.color===kc);
+            const quote = KICK_QUOTES[Math.floor(Math.random()*KICK_QUOTES.length)];
+            wheel.push({ ownerColor: targetColor, targetColor, jokerColor: kc, result, durationMs: 5000, attackerName: attacker?.name || "", victimName: victim?.name || "", quote }); // Christoph-Wunsch: 5s
 
             // Grant to selected recipient (thrower OR victim). Origin color=kc for display.
             if (result) {
