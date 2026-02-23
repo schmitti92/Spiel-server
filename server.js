@@ -1277,42 +1277,12 @@ broadcast(room, roomUpdatePayload(room));
       // Server entscheidet zufällig die Startfarbe (Quelle der Wahrheit)
       const starterColor = uniqueAct[Math.floor(Math.random() * uniqueAct.length)];
 
-// Auto-start after the wheel animation (server-chef, prevents double-start and "host must click twice")
-try{
-  const token = uid();
-  room._pendingStart = { starterColor, mode: (msg.mode || "classic"), ts: Date.now(), activeColors: uniqueAct, token };
-  const delay = 4200;
-  setTimeout(async ()=>{
-    try{
-      // Only if still pending and not already started
-      if(!room._pendingStart || room._pendingStart.token !== token) return;
-      if(room.state && room.state.started) { room._pendingStart = null; return; }
-      const pending = room._pendingStart;
-      room._pendingStart = null;
-
-      // Recompute active colors (only connected + chosen) to be safe
-      const act2 = Array.from(room.players.values())
-        .filter(p => isConnectedPlayer(p) && ALLOWED_COLORS.includes(p.color))
-        .map(p => p.color);
-      const uniqueAct2 = ALLOWED_COLORS.filter(c => act2.includes(c));
-      const finalAct = (uniqueAct2.length >= 2) ? uniqueAct2 : (pending.activeColors || uniqueAct);
-
-      initGameState(room, finalAct, pending.mode || "classic", pending.starterColor);
-      await persistRoomState(room);
-      console.log(`[start/auto] room=${room.code} starter=${room.state.turnColor}`);
-      broadcast(room, { type: "started", state: room.state });
-    }catch(e){
-      console.warn("[start/auto] failed:", e?.message || e);
-    }
-  }, delay);
-}catch(_e){
-  // fallback: keep old behavior (host can still send msg.type==="start")
-  room._pendingStart = { starterColor, mode: (msg.mode || "classic"), ts: Date.now(), activeColors: uniqueAct };
-}
+      // pending info (nur im RAM, kein Persist nötig)
+      room._pendingStart = { starterColor, mode: (msg.mode || "classic"), ts: Date.now() };
 
       broadcast(room, { type: "start_spin", activeColors: uniqueAct, starterColor, mode: (msg.mode || "classic"), durationMs: 4200 });
       return;
-}
+    }
 
     if (msg.type === "start") {
       const me = room.players.get(clientId);
@@ -1741,12 +1711,12 @@ if (msg.type === "move_request") {
             if (pp && pp.color) kickedColors.add(pp.color);
           }
 
-          const segments = ["allColors", "none", "barricade", "none", "reroll", "none", "double", "none"]; // 50% none
+          const segments = ["allColors","barricade","reroll","double"]; // 50% none
           wheel = [];
 
           for (const kc of kickedColors) {
             const pick = segments[Math.floor(Math.random() * segments.length)];
-            const result = (pick === "none") ? null : pick;
+            const result = pick;
 
             const awardMode = room.state?.jokerAwardMode || room.jokerAwardMode || "thrower";
             const targetColor = (awardMode === "victim") ? kc : activeColor;
