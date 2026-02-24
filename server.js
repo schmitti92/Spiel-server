@@ -156,8 +156,6 @@ function roomUpdatePayload(room, playersOverride) {
 const FIREBASE_ENABLED = String(process.env.FIREBASE_ENABLED || "").trim() === "1";
 const FIREBASE_COLLECTION = process.env.FIREBASE_COLLECTION || "rooms";
 
-
-const STATS_COLLECTION = process.env.STATS_COLLECTION || "stats";
 let firestore = null;
 
 function parseServiceAccountFromEnv() {
@@ -218,7 +216,6 @@ function initFirebaseIfConfigured() {
  }
  async function statsUpsert(name, patch){
    try{
-     initFirebaseIfConfigured();
      if(!firestore) return false;
      const displayName = normName(name);
      if(isGuestName(displayName)) return false;
@@ -611,7 +608,6 @@ app.get("/health", (_req, res) =>
 // --- Global Statistics (Lobby) ---
 app.get("/stats", async (_req, res) => {
   try{
-    initFirebaseIfConfigured();
     if(!firestore){
       return res.status(200).json({ ok:true, source:"none", rows: [] });
     }
@@ -1814,6 +1810,16 @@ if (joker === "choose" || joker === "sum") {
         winner: room.state.winnerColor,
         state: room.state,
       });
+
+      // Compatibility / UX: some clients show the end screen only on "game_over"
+      broadcast(room, {
+        type: "game_over",
+        reason: "forfeit",
+        by: myColor,
+        winner: room.state.winnerColor,
+        state: room.state,
+      });
+
       return;
     }
 
