@@ -156,6 +156,8 @@ function roomUpdatePayload(room, playersOverride) {
 const FIREBASE_ENABLED = String(process.env.FIREBASE_ENABLED || "").trim() === "1";
 const FIREBASE_COLLECTION = process.env.FIREBASE_COLLECTION || "rooms";
 
+
+const STATS_COLLECTION = process.env.STATS_COLLECTION || "stats";
 let firestore = null;
 
 function parseServiceAccountFromEnv() {
@@ -216,6 +218,7 @@ function initFirebaseIfConfigured() {
  }
  async function statsUpsert(name, patch){
    try{
+     initFirebaseIfConfigured();
      if(!firestore) return false;
      const displayName = normName(name);
      if(isGuestName(displayName)) return false;
@@ -608,29 +611,70 @@ app.get("/health", (_req, res) =>
 // --- Global Statistics (Lobby) ---
 app.get("/stats", async (_req, res) => {
   try{
+    initFirebaseIfConfigured();
+
     if(!firestore){
       return res.status(200).json({ ok:true, source:"none", rows: [] });
     }
-    const snap = await firestore.collection(STATS_COLLECTION).orderBy("wins","desc").orderBy("games","desc").limit(200).get();
-    const rows = [];
-    snap.forEach(doc => {
-      const d = doc.data() || {};
-      const games = Number(d.games||0)||0;
-      const wins = Number(d.wins||0)||0;
-      const rollCount = Number(d.rollCount||0)||0;
-      const rollSum = Number(d.rollSum||0)||0;
-      const playMs = Number(d.playMs||0)||0;
-      rows.push({
-        name: String(d.name||doc.id),
-        games,
-        wins,
-        forfeits: Number(d.forfeits||0)||0,
-        avgRoll: rollCount ? (rollSum/rollCount) : 0,
-        playMs,
-        updatedAt: Number(d.updatedAt||0)||0,
+
+    // Primary: composite sort (needs Firestore composite index)
+    try{
+      const snap = await firestore.collection(STATS_COLLECTION)
+        .orderBy("wins","desc")
+        .orderBy("games","desc")
+        .limit(200)
+        .get();
+
+      const rows = [];
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        const games = Number(d.games||0)||0;
+        const wins = Number(d.wins||0)||0;
+        const rollCount = Number(d.rollCount||0)||0;
+        const rollSum = Number(d.rollSum||0)||0;
+        const playMs = Number(d.playMs||0)||0;
+        rows.push({
+          name: String(d.name||doc.id),
+          games,
+          wins,
+          forfeits: Number(d.forfeits||0)||0,
+          avgRoll: rollCount ? (rollSum/rollCount) : 0,
+          playMs,
+          updatedAt: Number(d.updatedAt||0)||0,
+        });
       });
-    });
-    return res.status(200).json({ ok:true, source:"firestore", rows });
+      return res.status(200).json({ ok:true, source:"firestore", rows });
+    }catch(e){
+      // Fallback: if composite index missing, return a simpler ordering instead of failing.
+      const msg = String(e?.message||e||"");
+      const needsIndex = msg.includes("requires an index") || msg.includes("FAILED_PRECONDITION");
+      if(!needsIndex) throw e;
+
+      const snap = await firestore.collection(STATS_COLLECTION)
+        .orderBy("wins","desc")
+        .limit(200)
+        .get();
+
+      const rows = [];
+      snap.forEach(doc => {
+        const d = doc.data() || {};
+        const games = Number(d.games||0)||0;
+        const wins = Number(d.wins||0)||0;
+        const rollCount = Number(d.rollCount||0)||0;
+        const rollSum = Number(d.rollSum||0)||0;
+        const playMs = Number(d.playMs||0)||0;
+        rows.push({
+          name: String(d.name||doc.id),
+          games,
+          wins,
+          forfeits: Number(d.forfeits||0)||0,
+          avgRoll: rollCount ? (rollSum/rollCount) : 0,
+          playMs,
+          updatedAt: Number(d.updatedAt||0)||0,
+        });
+      });
+      return res.status(200).json({ ok:true, source:"firestore_fallback", rows, warning:"INDEX_MISSING" });
+    }
   }catch(e){
     return res.status(500).json({ ok:false, error:"STATS_ERR", message: e?.message||String(e) });
   }
@@ -1810,16 +1854,6 @@ if (joker === "choose" || joker === "sum") {
         winner: room.state.winnerColor,
         state: room.state,
       });
-
-      // Compatibility / UX: some clients show the end screen only on "game_over"
-      broadcast(room, {
-        type: "game_over",
-        reason: "forfeit",
-        by: myColor,
-        winner: room.state.winnerColor,
-        state: room.state,
-      });
-
       return;
     }
 
