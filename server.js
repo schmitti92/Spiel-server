@@ -198,6 +198,116 @@ function initFirebaseIfConfigured() {
   }
 }
 
+
+ // ---------- Global Barikade Stats (Firestore) ----------
+ // Requirements:
+ // - count ONLY registered names (no "Gast")
+ // - count a game when someone wins (including forfeit)
+ // - store in Firebase (Firestore). If Firestore unavailable, stats are skipped (game never breaks).
+ function normName(name){
+   return String(name||"").trim().replace(/\s+/g," ").slice(0,32);
+ }
+ function isGuestName(name){
+   const n = normName(name).toLowerCase();
+   return !n || n === "gast" || n === "guest";
+ }
+ function statsDocId(name){
+   return normName(name).toUpperCase().replace(/[^A-Z0-9_-]/g,"_").slice(0,64) || "UNKNOWN";
+ }
+ async function statsUpsert(name, patch){
+   try{
+     if(!firestore) return false;
+     const displayName = normName(name);
+     if(isGuestName(displayName)) return false;
+
+     const ref = firestore.collection(STATS_COLLECTION).doc(statsDocId(displayName));
+     await firestore.runTransaction(async (tx) => {
+       const snap = await tx.get(ref);
+       const cur = snap.exists ? (snap.data()||{}) : {};
+       const next = { ...cur };
+
+       // Keep display name (last seen)
+       next.name = displayName;
+
+       // Apply numeric increments or sets
+       for(const [k,v] of Object.entries(patch||{})){
+         if(typeof v === "number" && isFinite(v)){
+           next[k] = (typeof next[k]==="number" && isFinite(next[k])) ? next[k] + v : v;
+         }else if(v != null){
+           next[k] = v;
+         }
+       }
+
+       // Defaults
+       if(typeof next.games !== "number") next.games = 0;
+       if(typeof next.wins !== "number") next.wins = 0;
+       if(typeof next.forfeits !== "number") next.forfeits = 0;
+       if(typeof next.rollCount !== "number") next.rollCount = 0;
+       if(typeof next.rollSum !== "number") next.rollSum = 0;
+       if(typeof next.playMs !== "number") next.playMs = 0;
+
+       next.updatedAt = Date.now();
+       tx.set(ref, next, { merge: true });
+     });
+     return true;
+   }catch(e){
+     console.warn("[stats] upsert failed:", e?.message||e);
+     return false;
+   }
+ }
+ function getPlayerNameByColor(room, color){
+   try{
+     color = String(color||"").toLowerCase();
+     for(const p of room.players.values()){
+       if(String(p?.color||"").toLowerCase() === color){
+         return normName(p?.name);
+       }
+     }
+   }catch(_e){}
+   return "";
+ }
+ async function recordRollStat(room, color, value){
+   const name = getPlayerNameByColor(room, color);
+   if(isGuestName(name)) return;
+   await statsUpsert(name, { rollCount: 1, rollSum: Number(value)||0 });
+ }
+ async function finalizeMatchStats(room, winnerColor, opts={}){
+   try{
+     if(!room?.state) return;
+     if(room.state.statsFinalized) return;
+     room.state.statsFinalized = true;
+
+     const startedAt = Number(room.state.startedAt || 0) || 0;
+     const finishedAt = Number(room.state.finishedAt || Date.now()) || Date.now();
+     const playMs = Math.max(0, finishedAt - startedAt);
+
+     const active = Array.isArray(room.state.activeColors) && room.state.activeColors.length ? room.state.activeColors : ALLOWED_COLORS;
+     const winner = String(winnerColor||"").toLowerCase();
+
+     for(const c of active){
+       const name = getPlayerNameByColor(room, c);
+       if(isGuestName(name)) continue;
+       await statsUpsert(name, { games: 1, playMs });
+     }
+
+     const wName = getPlayerNameByColor(room, winner);
+     if(!isGuestName(wName)){
+       await statsUpsert(wName, { wins: 1 });
+     }
+
+     const forfeiter = String(opts.forfeiterColor||"").toLowerCase();
+     if(forfeiter){
+       const fName = getPlayerNameByColor(room, forfeiter);
+       if(!isGuestName(fName)){
+         await statsUpsert(fName, { forfeits: 1 });
+       }
+     }
+   }catch(e){
+     console.warn("[stats] finalize failed:", e?.message||e);
+   }
+ }
+
+
 function docIdForRoom(code) {
   // Keep identical sanitization as disk filename
   return String(code || "")
@@ -492,6 +602,40 @@ app.get("/health", (_req, res) =>
 );
 
 
+
+
+
+// --- Global Statistics (Lobby) ---
+app.get("/stats", async (_req, res) => {
+  try{
+    if(!firestore){
+      return res.status(200).json({ ok:true, source:"none", rows: [] });
+    }
+    const snap = await firestore.collection(STATS_COLLECTION).orderBy("wins","desc").orderBy("games","desc").limit(200).get();
+    const rows = [];
+    snap.forEach(doc => {
+      const d = doc.data() || {};
+      const games = Number(d.games||0)||0;
+      const wins = Number(d.wins||0)||0;
+      const rollCount = Number(d.rollCount||0)||0;
+      const rollSum = Number(d.rollSum||0)||0;
+      const playMs = Number(d.playMs||0)||0;
+      rows.push({
+        name: String(d.name||doc.id),
+        games,
+        wins,
+        forfeits: Number(d.forfeits||0)||0,
+        avgRoll: rollCount ? (rollSum/rollCount) : 0,
+        playMs,
+        updatedAt: Number(d.updatedAt||0)||0,
+      });
+    });
+    return res.status(200).json({ ok:true, source:"firestore", rows });
+  }catch(e){
+    return res.status(500).json({ ok:false, error:"STATS_ERR", message: e?.message||String(e) });
+  }
+});
+
 // --- Room presence (Lobby) ---
 // Returns current players list for a room (no join, read-only).
 app.get("/room/:code", (req, res) => {
@@ -577,6 +721,29 @@ for (const [a, b] of EDGES) {
 const STARTS = BOARD.meta?.starts || {};
 const GOAL = BOARD.meta?.goal || null;
 
+
+
+// ---------- Distances to goal (for forfeit winner calculation) ----------
+function computeDistancesFrom(startId){
+  if(!startId) return new Map();
+  const dist = new Map();
+  const q = [startId];
+  dist.set(startId, 0);
+  for(let qi=0; qi<q.length; qi++){
+    const u = q[qi];
+    const du = dist.get(u);
+    const ns = ADJ.get(u);
+    if(!ns) continue;
+    for(const v of ns){
+      if(!dist.has(v)){
+        dist.set(v, du+1);
+        q.push(v);
+      }
+    }
+  }
+  return dist;
+}
+const DIST_TO_GOAL = computeDistancesFrom(GOAL);
 const HOUSE_BY_COLOR = (() => {
   const map = { red: [], blue: [], green: [], yellow: [] };
   for (const n of BOARD.nodes || []) {
@@ -818,7 +985,11 @@ function initGameState(room, activeColors, mode = "classic", starterColor = null
 
   room.state = {
     started: true,
-    paused: false,
+    
+    matchId: uid(),
+    startedAt: Date.now(),
+    statsFinalized: false,
+paused: false,
     finished: false,
     winnerColor: null,
     finishedAt: null,
@@ -1574,6 +1745,9 @@ if (joker === "choose" || joker === "sum") {
 
       console.log(`[roll] room=${room.code} by=${room.state.turnColor} value=${v}`);
 
+      // Stats: track rolls for registered players (no Gast)
+      await recordRollStat(room, room.state.turnColor, v);
+
       room.state.rolled = v;
       room.lastRollWasSix = (v === 6);
       room.state.phase = "need_move";
@@ -1581,6 +1755,64 @@ if (joker === "choose" || joker === "sum") {
     broadcast(room, { type: "roll", value: v, state: room.state, double });
       return;
     }
+
+    
+    // ---------- FORFEIT / AUFGEBEN ----------
+    if (msg.type === "forfeit") {
+      if (!requireRoomState(room, ws)) return;
+
+      // Only a player with a color can forfeit
+      const me = room.players.get(clientId);
+      const myColor = String(me?.color || "").toLowerCase();
+      if (!myColor) { send(ws, { type:"error", code:"SPECTATOR", message:"Du hast keine Farbe" }); return; }
+      if (room.state.finished) { send(ws, { type:"error", code:"GAME_OVER", message:"Spiel ist bereits beendet" }); return; }
+
+      // Determine winner: player with the smallest distance to the goal (closest piece wins)
+      const goalId = room.state.goal || GOAL;
+      const active = Array.isArray(room.state.activeColors) && room.state.activeColors.length ? room.state.activeColors : ALLOWED_COLORS;
+
+      function minDistForColor(color){
+        let best = Infinity;
+        for(const p of (room.state.pieces || [])){
+          if(!p || String(p.color||"").toLowerCase() !== String(color||"").toLowerCase()) continue;
+          if(p.posKind !== "board") continue;
+          const d = DIST_TO_GOAL.get(p.nodeId);
+          if(typeof d === "number" && d < best) best = d;
+        }
+        return best;
+      }
+
+      // Build ranking (deterministic): distance asc, then active order
+      let winnerColor = null;
+      let bestDist = Infinity;
+      for(const c of active){
+        const d = minDistForColor(c);
+        if(d < bestDist){
+          bestDist = d;
+          winnerColor = c;
+        }
+      }
+      // If distances are missing (shouldn't), fall back to turnColor
+      if(!winnerColor) winnerColor = room.state.turnColor || active[0] || myColor;
+
+      setGameOver(room, winnerColor);
+
+      // Mark reason + forfeiter
+      room.state.gameOverReason = "forfeit";
+      room.state.forfeiterColor = myColor;
+
+      await finalizeMatchStats(room, room.state.winnerColor, { forfeiterColor: myColor });
+      await persistRoomState(room);
+
+      broadcast(room, {
+        type: "forfeit",
+        by: myColor,
+        winner: room.state.winnerColor,
+        state: room.state,
+      });
+      return;
+    }
+
 
     // ---------- END / SKIP ----------
     if (msg.type === "end_turn" || msg.type === "skip_turn") {
@@ -1817,6 +2049,7 @@ if (msg.type === "move_request") {
       if (winner) {
         setGameOver(room, winner);
         console.log(`[win] room=${room.code} winner=${room.state.winnerColor}`);
+        await finalizeMatchStats(room, room.state.winnerColor);
       }
 
       console.log(`[move] room=${room.code} active=${activeColor} moved=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
