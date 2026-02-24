@@ -198,6 +198,47 @@ function initFirebaseIfConfigured() {
   }
 }
 
+// =========================
+// Stats persistence fallback (disk) when Firestore is not configured
+// =========================
+const STATS_DISK_PATH = path.join(__dirname, "stats_disk.json");
+let diskStatsCache = null;
+
+function loadDiskStats(){
+  if(diskStatsCache) return diskStatsCache;
+  try{
+    const raw = fs.readFileSync(STATS_DISK_PATH, "utf8");
+    const j = JSON.parse(raw);
+    diskStatsCache = (j && typeof j==="object") ? j : {};
+  }catch(_e){
+    diskStatsCache = {};
+  }
+  return diskStatsCache;
+}
+function saveDiskStats(){
+  try{
+    if(!diskStatsCache) return;
+    fs.writeFileSync(STATS_DISK_PATH, JSON.stringify(diskStatsCache, null, 2), "utf8");
+  }catch(e){
+    console.warn("[stats] disk save failed:", e?.message||e);
+  }
+}
+
+function diskUpsert(name, delta){
+  const db = loadDiskStats();
+  const cur = db[name] || {};
+  const next = { ...cur };
+  for(const k of Object.keys(delta||{})){
+    const v = Number(delta[k]||0)||0;
+    next[k] = (Number(next[k]||0)||0) + v;
+  }
+  next.name = name;
+  next.updatedAt = Date.now();
+  db[name] = next;
+  saveDiskStats();
+  return next;
+}
+
 
  // ---------- Global Barikade Stats (Firestore) ----------
  // Requirements:
@@ -216,105 +257,35 @@ function initFirebaseIfConfigured() {
  }
  async function statsUpsert(name, patch){
    try{
-     if(!firestore) return false;
      const displayName = normName(name);
      if(isGuestName(displayName)) return false;
 
-     const ref = firestore.collection(STATS_COLLECTION).doc(statsDocId(displayName));
-     await firestore.runTransaction(async (tx) => {
-       const snap = await tx.get(ref);
-       const cur = snap.exists ? (snap.data()||{}) : {};
-       const next = { ...cur };
-
-       // Keep display name (last seen)
-       next.name = displayName;
-
-       // Apply numeric increments or sets
-       for(const [k,v] of Object.entries(patch||{})){
-         if(typeof v === "number" && isFinite(v)){
-           next[k] = (typeof next[k]==="number" && isFinite(next[k])) ? next[k] + v : v;
-         }else if(v != null){
-           next[k] = v;
+     // Firestore (preferred)
+     if(firestore){
+       const ref = firestore.collection(STATS_COLLECTION).doc(displayName);
+       await firestore.runTransaction(async (tx) => {
+         const snap = await tx.get(ref);
+         const cur = snap.exists ? (snap.data()||{}) : {};
+         const next = { ...cur };
+         for(const k of Object.keys(patch||{})){
+           const v = Number(patch[k]||0)||0;
+           next[k] = (Number(next[k]||0)||0) + v;
          }
-       }
+         next.name = displayName;
+         next.updatedAt = Date.now();
+         tx.set(ref, next, { merge:true });
+       });
+       return true;
+     }
 
-       // Defaults
-       if(typeof next.games !== "number") next.games = 0;
-       if(typeof next.wins !== "number") next.wins = 0;
-       if(typeof next.forfeits !== "number") next.forfeits = 0;
-       if(typeof next.rollCount !== "number") next.rollCount = 0;
-       if(typeof next.rollSum !== "number") next.rollSum = 0;
-       if(typeof next.playMs !== "number") next.playMs = 0;
-
-       next.updatedAt = Date.now();
-       tx.set(ref, next, { merge: true });
-     });
+     // Disk fallback (so Statistik funktioniert auch ohne Firebase)
+     diskUpsert(displayName, patch);
      return true;
    }catch(e){
      console.warn("[stats] upsert failed:", e?.message||e);
      return false;
    }
  }
- function getPlayerNameByColor(room, color){
-   try{
-     color = String(color||"").toLowerCase();
-     for(const p of room.players.values()){
-       if(String(p?.color||"").toLowerCase() === color){
-         return normName(p?.name);
-       }
-     }
-   }catch(_e){}
-   return "";
- }
- async function recordRollStat(room, color, value){
-   const name = getPlayerNameByColor(room, color);
-   if(isGuestName(name)) return;
-   await statsUpsert(name, { rollCount: 1, rollSum: Number(value)||0 });
- }
- async function finalizeMatchStats(room, winnerColor, opts={}){
-   try{
-     if(!room?.state) return;
-     if(room.state.statsFinalized) return;
-     room.state.statsFinalized = true;
-
-     const startedAt = Number(room.state.startedAt || 0) || 0;
-     const finishedAt = Number(room.state.finishedAt || Date.now()) || Date.now();
-     const playMs = Math.max(0, finishedAt - startedAt);
-
-     const active = Array.isArray(room.state.activeColors) && room.state.activeColors.length ? room.state.activeColors : ALLOWED_COLORS;
-     const winner = String(winnerColor||"").toLowerCase();
-
-     for(const c of active){
-       const name = getPlayerNameByColor(room, c);
-       if(isGuestName(name)) continue;
-       await statsUpsert(name, { games: 1, playMs });
-     }
-
-     const wName = getPlayerNameByColor(room, winner);
-     if(!isGuestName(wName)){
-       await statsUpsert(wName, { wins: 1 });
-     }
-
-     const forfeiter = String(opts.forfeiterColor||"").toLowerCase();
-     if(forfeiter){
-       const fName = getPlayerNameByColor(room, forfeiter);
-       if(!isGuestName(fName)){
-         await statsUpsert(fName, { forfeits: 1 });
-       }
-     }
-   }catch(e){
-     console.warn("[stats] finalize failed:", e?.message||e);
-   }
- }
-
-
-function docIdForRoom(code) {
-  // Keep identical sanitization as disk filename
-  return String(code || "")
-    .toUpperCase()
-    .replace(/[^A-Z0-9_-]/g, "")
-    .slice(0, 20) || "ROOM";
-}
 
 
 // ---------- Lobby Reservations (Name + Color Pre-Join) ----------
@@ -609,7 +580,18 @@ app.get("/health", (_req, res) =>
 app.get("/stats", async (_req, res) => {
   try{
     if(!firestore){
-      return res.status(200).json({ ok:true, source:"none", rows: [] });
+      const db = loadDiskStats();
+      const rows = Object.keys(db).map((name)=>{
+        const d = db[name] || {};
+        const games = Number(d.games||0)||0;
+        const wins = Number(d.wins||0)||0;
+        const rollCount = Number(d.rollCount||0)||0;
+        const rollSum = Number(d.rollSum||0)||0;
+        const playMs = Number(d.playMs||0)||0;
+        const avgRoll = rollCount ? (rollSum/rollCount) : 0;
+        return { name, games, wins, avgRoll, playMs };
+      }).sort((a,b)=> (b.wins-a.wins) || (b.games-a.games) || (a.name.localeCompare(b.name)) ).slice(0,200);
+      return res.status(200).json({ ok:true, source:"disk", rows });
     }
     const snap = await firestore.collection(STATS_COLLECTION).orderBy("wins","desc").orderBy("games","desc").limit(200).get();
     const rows = [];
