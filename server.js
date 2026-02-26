@@ -274,7 +274,120 @@ function initFirebaseIfConfigured() {
    if(isGuestName(name)) return;
    await statsUpsert(name, { rollCount: 1, rollSum: Number(value)||0 });
  }
- async function finalizeMatchStats(room, winnerColor, opts={}){
+ 
+ // ---------------- Match tracking (titles per finished game) ----------------
+ function ensureMatchTrack(room){
+   if(!room?.state) return;
+   if(!room.state.matchTrack){
+     const perPlayer = {};
+     (room.players||[]).forEach(p=>{
+       const nk = String(p.nameKey||"").trim();
+       if(!nk) return;
+       perPlayer[nk] = { kills:0, deaths:0, six:0, one:0, distance:0, turnSumMs:0, turnCount:0 };
+     });
+     room.state.matchTrack = { perPlayer, turnStartedAt: Date.now() };
+   }
+ }
+ function ensureMatchPlayer(room, nameKey){
+   ensureMatchTrack(room);
+   if(!room?.state?.matchTrack) return null;
+   const nk = String(nameKey||"").trim();
+   if(!nk) return null;
+   const per = room.state.matchTrack.perPlayer;
+   if(!per[nk]) per[nk] = { kills:0, deaths:0, six:0, one:0, distance:0, turnSumMs:0, turnCount:0 };
+   return per[nk];
+ }
+ function recordMatchRoll(room, color, value){
+   const name = getPlayerNameByColor(room, color);
+   if(!name || isGuestName(name)) return;
+   const st = ensureMatchPlayer(room, name);
+   if(!st) return;
+   const v = Number(value)||0;
+   if(v===1) st.one++;
+   if(v===6) st.six++;
+ }
+ function recordMatchMove(room, color, steps){
+   const name = getPlayerNameByColor(room, color);
+   if(!name || isGuestName(name)) return;
+   const st = ensureMatchPlayer(room, name);
+   if(!st) return;
+   st.distance += Math.max(0, Number(steps)||0);
+ }
+ function recordMatchKick(room, attackerColor, victimColor){
+   const attacker = getPlayerNameByColor(room, attackerColor);
+   const victim   = getPlayerNameByColor(room, victimColor);
+   if(attacker && !isGuestName(attacker)){
+     const a = ensureMatchPlayer(room, attacker);
+     if(a) a.kills++;
+   }
+   if(victim && !isGuestName(victim)){
+     const v = ensureMatchPlayer(room, victim);
+     if(v) v.deaths++;
+   }
+ }
+ function recordMatchTurnTime(room, color, ms){
+   const name = getPlayerNameByColor(room, color);
+   if(!name || isGuestName(name)) return;
+   const st = ensureMatchPlayer(room, name);
+   if(!st) return;
+   const capped = Math.max(0, Math.min(60000, Number(ms)||0)); // cap at 60s (AFK/reconnect safe)
+   st.turnSumMs += capped;
+   st.turnCount += 1;
+ }
+ function computeMatchAwards(room){
+   ensureMatchTrack(room);
+   const per = room?.state?.matchTrack?.perPlayer || {};
+   const rows = Object.entries(per).map(([name, s])=>({
+     name,
+     kills: s.kills||0,
+     deaths: s.deaths||0,
+     six: s.six||0,
+     one: s.one||0,
+     distance: s.distance||0,
+     avgTurnMs: (s.turnCount ? (s.turnSumMs/s.turnCount) : null)
+   })).filter(r=>r.name && !isGuestName(r.name));
+
+   const winnersMax = (key)=>{
+     const max = rows.reduce((m,r)=>Math.max(m, r[key]??0), -Infinity);
+     const ws = rows.filter(r=>(r[key]??0)===max).map(r=>r.name);
+     return { value:max, winners:ws };
+   };
+   const winnersMinAvg = ()=>{
+     const valid = rows.filter(r=>r.avgTurnMs!=null && isFinite(r.avgTurnMs));
+     if(valid.length===0) return { value:null, winners:[] };
+     const min = valid.reduce((m,r)=>Math.min(m, r.avgTurnMs), Infinity);
+     const ws = valid.filter(r=>r.avgTurnMs===min).map(r=>r.name);
+     return { value:min, winners:ws };
+   };
+   const winnersMaxAvg = ()=>{
+     const valid = rows.filter(r=>r.avgTurnMs!=null && isFinite(r.avgTurnMs));
+     if(valid.length===0) return { value:null, winners:[] };
+     const max = valid.reduce((m,r)=>Math.max(m, r.avgTurnMs), -Infinity);
+     const ws = valid.filter(r=>r.avgTurnMs===max).map(r=>r.name);
+     return { value:max, winners:ws };
+   };
+
+   const a1 = winnersMax("kills");
+   const a2 = winnersMax("deaths");
+   const a3 = winnersMax("six");
+   const a4 = winnersMax("one");
+   const a5 = winnersMax("distance");
+   const a6 = winnersMaxAvg();
+   const a7 = winnersMinAvg();
+
+   return [
+     { id:"kills",    title:"👊 Rauswurf‑König",      unit:"Gegner rausgeworfen", value:a1.value, winners:a1.winners },
+     { id:"deaths",   title:"🛡 Stehauf‑Männchen",    unit:"mal rausgeworfen",    value:a2.value, winners:a2.winners },
+     { id:"six",      title:"🎲 Glückspilz",         unit:"× 6 gewürfelt",       value:a3.value, winners:a3.winners },
+     { id:"one",      title:"🧊 Pechvogel",           unit:"× 1 gewürfelt",       value:a4.value, winners:a4.winners },
+     { id:"distance", title:"🥾 Wanderer",            unit:"Felder gelaufen",     value:a5.value, winners:a5.winners },
+     { id:"slow",     title:"🐢 Vieldenker",          unit:"Ø Sekunden pro Zug",  value:a6.value!=null?Math.round(a6.value/100)/10:null, winners:a6.winners },
+     { id:"fast",     title:"⚡ Blitzspieler",        unit:"Ø Sekunden pro Zug",  value:a7.value!=null?Math.round(a7.value/100)/10:null, winners:a7.winners },
+   ];
+ }
+ // --------------------------------------------------------------------------
+
+async function finalizeMatchStats(room, winnerColor, opts={}){
    try{
      if(!room?.state) return;
      if(room.state.statsFinalized) return;
@@ -1048,6 +1161,17 @@ paused: false,
     goal: GOAL,
     carryingByColor,
     activeColors: active,
+
+    // ---- Per-match tracking (for end-of-game title ceremony) ----
+    matchTrack: (function(){
+      const perPlayer = {};
+      (room.players || []).forEach(p=>{
+        const nk = String(p.nameKey||"").trim();
+        if(!nk) return;
+        perPlayer[nk] = { kills:0, deaths:0, six:0, one:0, distance:0, turnSumMs:0, turnCount:0 };
+      });
+      return { perPlayer, turnStartedAt: Date.now() };
+    })(),
   };
 }
 
@@ -1069,6 +1193,9 @@ function setGameOver(room, winnerColor) {
   room.state.winnerColor = String(winnerColor || "").toLowerCase() || null;
   room.state.finishedAt = Date.now();
   room.state.phase = "game_over";
+  try{
+    room.state.matchAwards = computeMatchAwards(room);
+  }catch(_e){ room.state.matchAwards = []; }
 }
 
 function nextTurnColor(room, current) {
@@ -1877,10 +2004,19 @@ if (joker === "choose" || joker === "sum") {
         if (eff.doubleRoll && eff.doubleRoll.by === ended) eff.doubleRoll = null;
       }
 
+      // per-match titles: turn time tracking (cap at 60s)
+      try{
+        if(room.state.matchTrack && room.state.matchTrack.turnStartedAt){
+          const dt = Date.now() - room.state.matchTrack.turnStartedAt;
+          recordMatchTurnTime(room, room.state.turnColor, dt);
+        }
+      }catch(_e){}
+
       room.lastRollWasSix = false;
       room.state.rolled = null;
       room.state.phase = "need_roll";
       room.state.turnColor = nextTurnColor(room, room.state.turnColor);
+      if(room.state.matchTrack) room.state.matchTrack.turnStartedAt = Date.now();
 
       await persistRoomState(room);
     broadcast(room, { type: "move", state: room.state });
@@ -1996,14 +2132,18 @@ if (msg.type === "move_request") {
 
       // kick opponent on landing
       const kicked = [];
+      const kickedVictimColors = [];
       for (const op of room.state.pieces) {
         if (op.posKind === "board" && op.nodeId === landed && op.color !== pc.color) {
+          kickedVictimColors.push(op.color);
           sendPieceHome(room, op);
           kicked.push(op.id);
         }
       }
 
-
+      if (kickedVictimColors.length) {
+        kickedVictimColors.forEach(vc=>recordMatchKick(room, color, vc));
+      }
 
       // Wheel: if a piece is kicked in Action-Mode, the ACTIVE (current) player gets a 50% chance
       // to receive a random joker. The joker "origin color" is the kicked piece color (for UI display).
@@ -2104,7 +2244,7 @@ if (msg.type === "move_request") {
         state: room.state
       });
       if (room.state.finished) {
-        broadcast(room, { type: "game_over", winnerColor: room.state.winnerColor, finishedAt: room.state.finishedAt });
+        broadcast(room, { type: "game_over", winnerColor: room.state.winnerColor, finishedAt: room.state.finishedAt, awards: room.state.matchAwards || [] });
       }
       // Persist after every successful move so a server restart has the newest possible state.
       await persistRoomState(room);
