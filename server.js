@@ -1878,16 +1878,20 @@ if (joker === "choose" || joker === "sum") {
       return;
     }
 
-    
     if (msg.type === "cancel_joker") {
-      requireRoomState(room);
-      requireTurn(room); // only active player can cancel their pending effect
-      if (!room.state || !room.state.action) return;
+      if (!requireRoomState(room, ws)) return;
+      if (!requireTurn(room, clientId, ws)) return;
+
+      if (String(room.state.mode || "classic") !== "action" || !room.state.action) {
+        send(ws, { type: "error", code: "NOT_ACTION", message: "Action-Modus ist nicht aktiv" });
+        return;
+      }
+
       const action = room.state.action;
       ensureActionJokers(action);
 
       const turnColor = room.state.turnColor;
-      const kindRaw = String(msg.joker || "").toLowerCase();
+      const kindRaw = String(msg.joker || "").toLowerCase().trim();
 
       // Normalize to server joker keys
       const kind =
@@ -1897,31 +1901,34 @@ if (joker === "choose" || joker === "sum") {
         kindRaw === "reroll" ? "reroll" :
         kindRaw;
 
-      // Cancel only makes sense for pending / toggle-like jokers
+      // Cancel only makes sense for toggle-like jokers
       if (kind === "allColors") {
+        // AllColors is consumed on activation -> refund on cancel if still active
         if (action.effects?.allColorsBy === turnColor) {
           action.effects.allColorsBy = null;
-          // Refund the joker because activation consumed it, but no move happened.
           addOwnedJoker(action, turnColor, "allColors", turnColor, "cancel_refund");
+          syncJokerCountsFromOwned(action);
         }
       } else if (kind === "barricade") {
+        // Barricade is consumed only on successful move -> just clear effect
         if (action.effects?.barricadeBy === turnColor) {
           action.effects.barricadeBy = null;
-          // Note: barricade joker is NOT consumed on activation (only on actual move),
-          // so no refund needed.
         }
       } else if (kind === "double") {
-        if (action.effects?.doubleRoll && action.effects.doubleRoll.by === turnColor && action.effects.doubleRoll.pending === true) {
+        // Double is consumed on activation -> refund only if still pending (not rolled yet)
+        if (action.effects?.doubleRoll
+            && action.effects.doubleRoll.by === turnColor
+            && action.effects.doubleRoll.pending === true) {
           action.effects.doubleRoll = null;
-          // Refund because activation consumed it, but roll has not happened.
           addOwnedJoker(action, turnColor, "double", turnColor, "cancel_refund");
+          syncJokerCountsFromOwned(action);
         }
       } else {
-        // unknown / non-cancellable joker -> ignore
+        // reroll / choose / sum etc. are not cancellable (would change game state)
       }
 
-      touchRoom(room);
-      broadcastRoom(room);
+      await persistRoomState(room);
+      broadcast(room, { type: "snapshot", state: room.state, jokerCanceled: kindRaw });
       return;
     }
 
