@@ -2242,7 +2242,7 @@ if (msg.type === "move_request") {
       }
 
       if (kickedVictimColors.length) {
-        kickedVictimColors.forEach(vc=>recordMatchKick(room, color, vc));
+        kickedVictimColors.forEach(vc=>recordMatchKick(room, activeColor, vc));
       }
 
       // Wheel: if a piece is kicked in Action-Mode, the ACTIVE (current) player gets a 50% chance
