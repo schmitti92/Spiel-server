@@ -158,8 +158,6 @@ const FIREBASE_COLLECTION = process.env.FIREBASE_COLLECTION || "rooms";
 
 
 const STATS_COLLECTION = process.env.STATS_COLLECTION || "stats";
-
-const MATCHES_COLLECTION = process.env.MATCHES_COLLECTION || "matches";
 let firestore = null;
 
 function parseServiceAccountFromEnv() {
@@ -301,17 +299,10 @@ function initFirebaseIfConfigured() {
    return "";
  }
  async function recordRollStat(room, color, value){
-  try{
-    if(!room?.state) return;
-    const c = String(color||"").toLowerCase();
-    const v = Number(value)||0;
-    ensureMatchAgg(room);
-    if(room.state.matchAgg && room.state.matchAgg.rolls && room.state.matchAgg.rolls[c]){
-      room.state.matchAgg.rolls[c].count += 1;
-      room.state.matchAgg.rolls[c].sum += v;
-    }
-  }catch(_e){}
-}
+   const name = getPlayerNameByColor(room, color);
+   if(isGuestName(name)) return;
+   await statsUpsert(name, { rollCount: 1, rollSum: Number(value)||0 });
+ }
  
  // ---------------- Match tracking (titles per finished game) ----------------
  function ensureMatchTrack(room){
@@ -352,33 +343,17 @@ function initFirebaseIfConfigured() {
    st.distance += Math.max(0, Number(steps)||0);
  }
  function recordMatchKick(room, attackerColor, victimColor){
-  // Aggregated per-match counters (used for idempotent server-side stats finalize)
-  try{
-    if(room?.state){
-      ensureMatchAgg(room);
-      const aC = String(attackerColor||"").toLowerCase();
-      const vC = String(victimColor||"").toLowerCase();
-      if(room.state.matchAgg?.kicks?.by && typeof room.state.matchAgg.kicks.by[aC] === "number"){
-        room.state.matchAgg.kicks.by[aC] += 1;
-      }
-      if(room.state.matchAgg?.kicks?.taken && typeof room.state.matchAgg.kicks.taken[vC] === "number"){
-        room.state.matchAgg.kicks.taken[vC] += 1;
-      }
-    }
-  }catch(_e){}
-
-  // Existing title/awards tracking (kept)
-  const attacker = getPlayerNameByColor(room, attackerColor);
-  const victim   = getPlayerNameByColor(room, victimColor);
-  if(attacker && !isGuestName(attacker)){
-    const a = ensureMatchPlayer(room, attacker);
-    if(a) a.kills++;
-  }
-  if(victim && !isGuestName(victim)){
-    const v = ensureMatchPlayer(room, victim);
-    if(v) v.deaths++;
-  }
-}
+   const attacker = getPlayerNameByColor(room, attackerColor);
+   const victim   = getPlayerNameByColor(room, victimColor);
+   if(attacker && !isGuestName(attacker)){
+     const a = ensureMatchPlayer(room, attacker);
+     if(a) a.kills++;
+   }
+   if(victim && !isGuestName(victim)){
+     const v = ensureMatchPlayer(room, victim);
+     if(v) v.deaths++;
+   }
+ }
  function recordMatchTurnTime(room, color, ms){
    const name = getPlayerNameByColor(room, color);
    if(!name || isGuestName(name)) return;
@@ -442,119 +417,6 @@ function initFirebaseIfConfigured() {
  // --------------------------------------------------------------------------
 
 async function finalizeMatchStats(room, winnerColor, opts={}){
-  try{
-    if(!room?.state) return;
-    if(isTestRoom(room)) return;
-    if(room.state.statsFinalized) return;
-
-    // Ensure we have matchId and aggregation container
-    if(!room.state.matchId) room.state.matchId = uid();
-    ensureMatchAgg(room);
-
-    room.state.statsFinalized = true;
-
-    const startedAt = Number(room.state.startedAt || 0) || 0;
-    const finishedAt = Number(room.state.finishedAt || Date.now()) || Date.now();
-    const playMs = Math.max(0, finishedAt - startedAt);
-
-    const active = Array.isArray(room.state.activeColors) && room.state.activeColors.length ? room.state.activeColors : ALLOWED_COLORS;
-    const winner = String(winnerColor||"").toLowerCase();
-    const forfeiter = String(opts.forfeiterColor||"").toLowerCase();
-
-    initFirebaseIfConfigured();
-    if(!firestore){
-      // Firestore unavailable: do not break gameplay. We still keep statsFinalized in memory.
-      return;
-    }
-
-    const matchId = String(room.state.matchId);
-    const matchRef = firestore.collection(MATCHES_COLLECTION).doc(matchId);
-
-    // Prepare match document snapshot (kept small + useful)
-    const playersByColor = {};
-    for(const c of active){
-      playersByColor[c] = { name: getPlayerNameByColor(room, c) || "", color: c };
-    }
-
-    const agg = room.state.matchAgg || {};
-    const rolls = agg.rolls || {};
-    const kicksBy = (agg.kicks && agg.kicks.by) ? agg.kicks.by : {};
-    const kicksTaken = (agg.kicks && agg.kicks.taken) ? agg.kicks.taken : {};
-    const jokersUsed = agg.jokersUsed || {};
-
-    const matchDoc = {
-      matchId,
-      roomCode: room.code || "",
-      mode: String(room.state.mode || "classic"),
-      startedAt,
-      finishedAt,
-      playMs,
-      activeColors: active,
-      winnerColor: winner || null,
-      winnerName: getPlayerNameByColor(room, winner) || "",
-      gameOverReason: room.state.gameOverReason || "win",
-      forfeiterColor: forfeiter || null,
-      forfeiterName: forfeiter ? (getPlayerNameByColor(room, forfeiter) || "") : "",
-      rolls,
-      kicks: { by: kicksBy, taken: kicksTaken },
-      jokersUsed,
-      createdAt: Date.now(),
-    };
-
-    // Idempotent finalize:
-    // - If match already exists, do NOT increment aggregated player stats again.
-    await firestore.runTransaction(async (tx) => {
-      const snap = await tx.get(matchRef);
-      if(snap.exists){
-        return; // already finalized in DB
-      }
-
-      tx.set(matchRef, matchDoc, { merge: false });
-
-      const inc = admin.firestore.FieldValue.increment;
-
-      for(const c of active){
-        const name = getPlayerNameByColor(room, c);
-        if(isGuestName(name)) continue;
-
-        const docRef = firestore.collection(STATS_COLLECTION).doc(statsDocId(name));
-        const r = rolls && rolls[c] ? rolls[c] : { count:0, sum:0 };
-        const jb = jokersUsed && jokersUsed[c] ? jokersUsed[c] : {};
-        const kg = Number(kicksBy?.[c] || 0) || 0;
-        const kt = Number(kicksTaken?.[c] || 0) || 0;
-
-        const patch = {
-          name: normName(name),
-          games: inc(1),
-          playMs: inc(playMs),
-          rollCount: inc(Number(r.count||0)||0),
-          rollSum: inc(Number(r.sum||0)||0),
-          kicksGiven: inc(kg),
-          kicksTaken: inc(kt),
-          jokersAllColors: inc(Number(jb.allColors||0)||0),
-          jokersBarricade: inc(Number(jb.barricade||0)||0),
-          jokersReroll: inc(Number(jb.reroll||0)||0),
-          jokersDouble: inc(Number(jb.double||0)||0),
-          jokersChoose: inc(Number(jb.choose||0)||0),
-          jokersSum: inc(Number(jb.sum||0)||0),
-          updatedAt: Date.now(),
-        };
-
-        if(c === winner && !isGuestName(getPlayerNameByColor(room, winner))){
-          patch.wins = inc(1);
-        }
-        if(forfeiter && c === forfeiter){
-          patch.forfeits = inc(1);
-        }
-
-        tx.set(docRef, patch, { merge: true });
-      }
-    });
-
-  }catch(e){
-    console.warn("[stats] finalize failed:", e?.message||e);
-  }
-}){
    try{
      if(!room?.state) return;
      if(isTestRoom(room)) return;
@@ -689,40 +551,7 @@ function reserveLobby(room, nameKey, color, status){
 // ---------- Match Stats safety guard ----------
 // Some deployed versions call ensureMatchStats() during initGameState.
 // If stats are not enabled in this build, we keep a safe no-op to avoid crashes.
-function ensureMatchAgg(room){
-  try{
-    if(!room) return;
-    if(!room.state || typeof room.state !== "object") return;
-    if(!room.state.matchAgg || typeof room.state.matchAgg !== "object"){
-      room.state.matchAgg = { v: 1, rolls: {}, kicks: { by:{}, taken:{} }, jokersUsed: {} };
-    }
-    const a = room.state.matchAgg;
-    if(!a.rolls || typeof a.rolls !== "object") a.rolls = {};
-    if(!a.kicks || typeof a.kicks !== "object") a.kicks = { by:{}, taken:{} };
-    if(!a.kicks.by || typeof a.kicks.by !== "object") a.kicks.by = {};
-    if(!a.kicks.taken || typeof a.kicks.taken !== "object") a.kicks.taken = {};
-    if(!a.jokersUsed || typeof a.jokersUsed !== "object") a.jokersUsed = {};
-    for(const c of ALLOWED_COLORS){
-      if(!a.rolls[c] || typeof a.rolls[c] !== "object") a.rolls[c] = { count:0, sum:0 };
-      if(typeof a.rolls[c].count !== "number") a.rolls[c].count = 0;
-      if(typeof a.rolls[c].sum !== "number") a.rolls[c].sum = 0;
-
-      if(typeof a.kicks.by[c] !== "number") a.kicks.by[c] = 0;
-      if(typeof a.kicks.taken[c] !== "number") a.kicks.taken[c] = 0;
-
-      if(!a.jokersUsed[c] || typeof a.jokersUsed[c] !== "object"){
-        a.jokersUsed[c] = { allColors:0, barricade:0, reroll:0, double:0, choose:0, sum:0 };
-      } else {
-        for(const k of ["allColors","barricade","reroll","double","choose","sum"]){
-          if(typeof a.jokersUsed[c][k] !== "number") a.jokersUsed[c][k] = 0;
-        }
-      }
-    }
-  }catch(_e){}
-}
-
-// Backward compat shim (some builds call ensureMatchStats during initGameState)
-function ensureMatchStats(room){ ensureMatchAgg(room); }
+function ensureMatchStats(_room){ /* no-op unless stats module is present */ }
 
 // ---------- Save / Restore (best-effort) ----------
 // NOTE: On some hosts (z.B. Render free) kann das Dateisystem nach Restart leer sein.
@@ -778,7 +607,6 @@ async function restoreRoomState(room){
       const data = snap.exists ? snap.data() : null;
       if (data?.state && typeof data.state === "object") {
         room.state = data.state;
-        try{ ensureMatchAgg(room); }catch(_e){}
         // Backward-compat + safety defaults
         if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
           room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
@@ -835,7 +663,6 @@ async function restoreRoomState(room){
     const payload = JSON.parse(raw);
     if(payload && payload.state && typeof payload.state === "object"){
       room.state = payload.state;
-      try{ ensureMatchAgg(room); }catch(_e){}
       if (!room.state.carryingByColor || typeof room.state.carryingByColor !== "object") {
         room.state.carryingByColor = { red: false, blue: false, green: false, yellow: false };
       } else {
@@ -1349,7 +1176,6 @@ function initGameState(room, activeColors, mode = "classic", starterColor = null
     isTest: (room.isTest === true) || isTestRoomCode(room.code),
     
     matchId: uid(),
-    matchAgg: { v: 1, rolls: { red:{count:0,sum:0}, blue:{count:0,sum:0}, green:{count:0,sum:0}, yellow:{count:0,sum:0} }, kicks: { by:{ red:0, blue:0, green:0, yellow:0 }, taken:{ red:0, blue:0, green:0, yellow:0 } }, jokersUsed: { red:{ allColors:0, barricade:0, reroll:0, double:0, choose:0, sum:0 }, blue:{ allColors:0, barricade:0, reroll:0, double:0, choose:0, sum:0 }, green:{ allColors:0, barricade:0, reroll:0, double:0, choose:0, sum:0 }, yellow:{ allColors:0, barricade:0, reroll:0, double:0, choose:0, sum:0 } } },
     startedAt: Date.now(),
     statsFinalized: false,
 paused: false,
@@ -1978,8 +1804,6 @@ broadcast(room, roomUpdatePayload(room));
         }
         room.state.action.effects.allColorsBy = turnColor;
         consumeNow("allColors");
-        try{ ensureMatchAgg(room); if(room.state?.matchAgg?.jokersUsed?.[turnColor]) room.state.matchAgg.jokersUsed[turnColor].allColors += 1; }catch(_e){}
-
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "allcolors" });
         return;
@@ -2020,8 +1844,6 @@ broadcast(room, roomUpdatePayload(room));
         room.state.rolled = null;
         room.state.phase = "need_roll";
         consumeNow("reroll");
-        try{ ensureMatchAgg(room); if(room.state?.matchAgg?.jokersUsed?.[turnColor]) room.state.matchAgg.jokersUsed[turnColor].reroll += 1; }catch(_e){}
-
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "reroll" });
         return;
@@ -2042,8 +1864,6 @@ broadcast(room, roomUpdatePayload(room));
         }
         room.state.action.effects.doubleRoll = { kind: "sum2", by: turnColor, pending: true, rolls: null, chosen: null };
         consumeNow("double");
-        try{ ensureMatchAgg(room); if(room.state?.matchAgg?.jokersUsed?.[turnColor]) room.state.matchAgg.jokersUsed[turnColor].double += 1; }catch(_e){}
-
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "double" });
         return;
@@ -2058,16 +1878,20 @@ if (joker === "choose" || joker === "sum") {
       return;
     }
 
-    
     if (msg.type === "cancel_joker") {
-      requireRoomState(room);
-      requireTurn(room); // only active player can cancel their pending effect
-      if (!room.state || !room.state.action) return;
+      if (!requireRoomState(room, ws)) return;
+      if (!requireTurn(room, clientId, ws)) return;
+
+      if (String(room.state.mode || "classic") !== "action" || !room.state.action) {
+        send(ws, { type: "error", code: "NOT_ACTION", message: "Action-Modus ist nicht aktiv" });
+        return;
+      }
+
       const action = room.state.action;
       ensureActionJokers(action);
 
       const turnColor = room.state.turnColor;
-      const kindRaw = String(msg.joker || "").toLowerCase();
+      const kindRaw = String(msg.joker || "").toLowerCase().trim();
 
       // Normalize to server joker keys
       const kind =
@@ -2077,31 +1901,34 @@ if (joker === "choose" || joker === "sum") {
         kindRaw === "reroll" ? "reroll" :
         kindRaw;
 
-      // Cancel only makes sense for pending / toggle-like jokers
+      // Cancel only makes sense for toggle-like jokers
       if (kind === "allColors") {
+        // AllColors is consumed on activation -> refund on cancel if still active
         if (action.effects?.allColorsBy === turnColor) {
           action.effects.allColorsBy = null;
-          // Refund the joker because activation consumed it, but no move happened.
           addOwnedJoker(action, turnColor, "allColors", turnColor, "cancel_refund");
+          syncJokerCountsFromOwned(action);
         }
       } else if (kind === "barricade") {
+        // Barricade is consumed only on successful move -> just clear effect
         if (action.effects?.barricadeBy === turnColor) {
           action.effects.barricadeBy = null;
-          // Note: barricade joker is NOT consumed on activation (only on actual move),
-          // so no refund needed.
         }
       } else if (kind === "double") {
-        if (action.effects?.doubleRoll && action.effects.doubleRoll.by === turnColor && action.effects.doubleRoll.pending === true) {
+        // Double is consumed on activation -> refund only if still pending (not rolled yet)
+        if (action.effects?.doubleRoll
+            && action.effects.doubleRoll.by === turnColor
+            && action.effects.doubleRoll.pending === true) {
           action.effects.doubleRoll = null;
-          // Refund because activation consumed it, but roll has not happened.
           addOwnedJoker(action, turnColor, "double", turnColor, "cancel_refund");
+          syncJokerCountsFromOwned(action);
         }
       } else {
-        // unknown / non-cancellable joker -> ignore
+        // reroll / choose / sum etc. are not cancellable (would change game state)
       }
 
-      touchRoom(room);
-      broadcastRoom(room);
+      await persistRoomState(room);
+      broadcast(room, { type: "snapshot", state: room.state, jokerCanceled: kindRaw });
       return;
     }
 
@@ -2147,8 +1974,6 @@ if (msg.type === "action_barricade_move") {
       try{
         if (room.state.action) {
           consumeOwnedJoker(room.state.action, turnColor, "barricade");
-          try{ ensureMatchAgg(room); if(room.state?.matchAgg?.jokersUsed?.[turnColor]) room.state.matchAgg.jokersUsed[turnColor].barricade += 1; }catch(_e){}
-
         }
       }catch(_e){}
       await persistRoomState(room);
