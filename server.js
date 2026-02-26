@@ -213,6 +213,35 @@ function initFirebaseIfConfigured() {
    const n = normName(name).toLowerCase();
    return !n || n === "gast" || n === "guest";
  }
+
+ // ---------- Test Mode (Exclude from Stats) ----------
+ // If a room is marked as test, we do NOT write roll/game stats to Firestore.
+ // How a room becomes "test":
+ // 1) Room code starts with one of TEST_ROOM_PREFIXES (default: "TEST")
+ // 2) Host can toggle it in lobby via WS message: {type:"set_test_mode", isTest:true}
+ const TEST_ROOM_PREFIXES = String(process.env.TEST_ROOM_PREFIXES || "TEST")
+   .split(",")
+   .map(s => s.trim().toUpperCase())
+   .filter(Boolean);
+
+ function isTestRoomCode(code){
+   const c = normalizeRoomCode(code);
+   if(!c) return false;
+   for(const pref of TEST_ROOM_PREFIXES){
+     if(pref && c.startsWith(pref)) return true;
+   }
+   return false;
+ }
+
+ function isTestRoom(room){
+   try{
+     if(room?.state && room.state.isTest === true) return true;
+     if(room?.isTest === true) return true;
+     return isTestRoomCode(room?.code);
+   }catch(_e){
+     return false;
+   }
+ }
  function statsDocId(name){
    return normName(name).toUpperCase().replace(/[^A-Z0-9_-]/g,"_").slice(0,64) || "UNKNOWN";
  }
@@ -390,6 +419,7 @@ function initFirebaseIfConfigured() {
 async function finalizeMatchStats(room, winnerColor, opts={}){
    try{
      if(!room?.state) return;
+     if(isTestRoom(room)) return;
      if(room.state.statsFinalized) return;
      room.state.statsFinalized = true;
 
@@ -928,6 +958,7 @@ function uid() {
 function makeRoom(code) {
   return {
     code,
+    isTest: false, // host-toggleable test mode (excluded from stats)
     lobby: { reservations: {}, colorLocks: {} },
     hostToken: null, // stable host identity (sessionToken)
     // Socket index for this room (used for host-swap/reconnect messaging)
@@ -1142,6 +1173,7 @@ function initGameState(room, activeColors, mode = "classic", starterColor = null
 
   room.state = {
     started: true,
+    isTest: (room.isTest === true) || isTestRoomCode(room.code),
     
     matchId: uid(),
     startedAt: Date.now(),
@@ -1620,7 +1652,21 @@ broadcast(room, roomUpdatePayload(room));
     }
 
     
-    // ---------- JOKER AWARD MODE ----------
+    
+    // ---------- TEST MODE (Host, lobby only) ----------
+    // Additive: lets the host flag a room as "test" so roll/game stats are NOT recorded.
+    // Safe: does not change gameplay; only affects Firestore stats writes.
+    if (msg.type === "set_test_mode") {
+      const me = room.players.get(clientId);
+      if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host" }); return; }
+      if (room.state) { send(ws, { type: "error", code: "GAME_STARTED", message: "Testmodus nur vor Spielstart" }); return; }
+      room.isTest = !!(msg.isTest ?? msg.value ?? msg.enabled);
+      broadcast(room, { type: "test_mode", isTest: room.isTest, prefixes: TEST_ROOM_PREFIXES });
+      broadcast(room, roomUpdatePayload(room));
+      return;
+    }
+
+// ---------- JOKER AWARD MODE ----------
     if (msg.type === "set_award_mode") {
       const me = room.players.get(clientId);
       if (!me?.isHost) { send(ws, { type: "error", code: "NOT_HOST", message: "Nur Host kann den Modus ändern" }); return; }
@@ -1832,7 +1878,54 @@ if (joker === "choose" || joker === "sum") {
       return;
     }
 
-    if (msg.type === "action_barricade_move") {
+    
+    if (msg.type === "cancel_joker") {
+      requireRoomState(room);
+      requireTurn(room); // only active player can cancel their pending effect
+      if (!room.state || !room.state.action) return;
+      const action = room.state.action;
+      ensureActionJokers(action);
+
+      const turnColor = room.state.turnColor;
+      const kindRaw = String(msg.joker || "").toLowerCase();
+
+      // Normalize to server joker keys
+      const kind =
+        kindRaw === "allcolors" ? "allColors" :
+        kindRaw === "barricade" ? "barricade" :
+        kindRaw === "double" ? "double" :
+        kindRaw === "reroll" ? "reroll" :
+        kindRaw;
+
+      // Cancel only makes sense for pending / toggle-like jokers
+      if (kind === "allColors") {
+        if (action.effects?.allColorsBy === turnColor) {
+          action.effects.allColorsBy = null;
+          // Refund the joker because activation consumed it, but no move happened.
+          addOwnedJoker(action, turnColor, "allColors", turnColor, "cancel_refund");
+        }
+      } else if (kind === "barricade") {
+        if (action.effects?.barricadeBy === turnColor) {
+          action.effects.barricadeBy = null;
+          // Note: barricade joker is NOT consumed on activation (only on actual move),
+          // so no refund needed.
+        }
+      } else if (kind === "double") {
+        if (action.effects?.doubleRoll && action.effects.doubleRoll.by === turnColor && action.effects.doubleRoll.pending === true) {
+          action.effects.doubleRoll = null;
+          // Refund because activation consumed it, but roll has not happened.
+          addOwnedJoker(action, turnColor, "double", turnColor, "cancel_refund");
+        }
+      } else {
+        // unknown / non-cancellable joker -> ignore
+      }
+
+      touchRoom(room);
+      broadcastRoom(room);
+      return;
+    }
+
+if (msg.type === "action_barricade_move") {
       if (!requireRoomState(room, ws)) return;
       if (!requireTurn(room, clientId, ws)) return;
 
