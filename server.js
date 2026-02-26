@@ -342,6 +342,21 @@ function initFirebaseIfConfigured() {
    if(!st) return;
    st.distance += Math.max(0, Number(steps)||0);
  }
+
+// Track joker usage per match (for titles). Server is chef.
+function recordMatchJoker(room, color, type){
+  const name = getPlayerNameByColor(room, color);
+  if(!name || isGuestName(name)) return;
+  const st = ensureMatchPlayer(room, name);
+  if(!st) return;
+  if(typeof st.jokersUsed !== "number") st.jokersUsed = 0;
+  st.jokersUsed += 1;
+  const k = String(type||"").toLowerCase();
+  if(k){
+    if(!st.jokersByType || typeof st.jokersByType !== "object") st.jokersByType = {};
+    st.jokersByType[k] = (typeof st.jokersByType[k]==="number" ? st.jokersByType[k] : 0) + 1;
+  }
+}
  function recordMatchKick(room, attackerColor, victimColor){
    const attacker = getPlayerNameByColor(room, attackerColor);
    const victim   = getPlayerNameByColor(room, victimColor);
@@ -373,6 +388,7 @@ function initFirebaseIfConfigured() {
      six: s.six||0,
      one: s.one||0,
      distance: s.distance||0,
+     jokersUsed: s.jokersUsed||0,
      avgTurnMs: (s.turnCount ? (s.turnSumMs/s.turnCount) : null)
    })).filter(r=>r.name && !isGuestName(r.name));
 
@@ -401,6 +417,7 @@ function initFirebaseIfConfigured() {
    const a3 = winnersMax("six");
    const a4 = winnersMax("one");
    const a5 = winnersMax("distance");
+   const a8 = winnersMax("jokersUsed");
    const a6 = winnersMaxAvg();
    const a7 = winnersMinAvg();
 
@@ -410,6 +427,7 @@ function initFirebaseIfConfigured() {
      { id:"six",      title:"🎲 Glückspilz",         unit:"× 6 gewürfelt",       value:a3.value, winners:a3.winners },
      { id:"one",      title:"🧊 Pechvogel",           unit:"× 1 gewürfelt",       value:a4.value, winners:a4.winners },
      { id:"distance", title:"🥾 Wanderer",            unit:"Felder gelaufen",     value:a5.value, winners:a5.winners },
+     { id:"jokers",   title:"🃏 Joker‑Meister",       unit:"Joker genutzt",       value:a8.value, winners:a8.winners },
      { id:"slow",     title:"🐢 Vieldenker",          unit:"Ø Sekunden pro Zug",  value:a6.value!=null?Math.round(a6.value/100)/10:null, winners:a6.winners },
      { id:"fast",     title:"⚡ Blitzspieler",        unit:"Ø Sekunden pro Zug",  value:a7.value!=null?Math.round(a7.value/100)/10:null, winners:a7.winners },
    ];
@@ -1198,7 +1216,8 @@ paused: false,
     matchTrack: (function(){
       const perPlayer = {};
       (room.players || []).forEach(p=>{
-        const nk = String(p.nameKey||"").trim();
+        // room.players is a Map; values contain {name,...}. nameKey is not guaranteed.
+        const nk = String(p?.name || p?.nameKey || "").trim();
         if(!nk) return;
         perPlayer[nk] = { kills:0, deaths:0, six:0, one:0, distance:0, turnSumMs:0, turnCount:0 };
       });
@@ -1804,6 +1823,7 @@ broadcast(room, roomUpdatePayload(room));
         }
         room.state.action.effects.allColorsBy = turnColor;
         consumeNow("allColors");
+        try{ recordMatchJoker(room, turnColor, "allColors"); }catch(_e){}
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "allcolors" });
         return;
@@ -1844,6 +1864,7 @@ broadcast(room, roomUpdatePayload(room));
         room.state.rolled = null;
         room.state.phase = "need_roll";
         consumeNow("reroll");
+        try{ recordMatchJoker(room, turnColor, "reroll"); }catch(_e){}
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "reroll" });
         return;
@@ -1864,6 +1885,7 @@ broadcast(room, roomUpdatePayload(room));
         }
         room.state.action.effects.doubleRoll = { kind: "sum2", by: turnColor, pending: true, rolls: null, chosen: null };
         consumeNow("double");
+        try{ recordMatchJoker(room, turnColor, "double"); }catch(_e){}
         await persistRoomState(room);
         broadcast(room, { type: "snapshot", state: room.state, joker: "double" });
         return;
@@ -1974,6 +1996,7 @@ if (msg.type === "action_barricade_move") {
       try{
         if (room.state.action) {
           consumeOwnedJoker(room.state.action, turnColor, "barricade");
+          try{ recordMatchJoker(room, turnColor, "barricade"); }catch(_e){}
         }
       }catch(_e){}
       await persistRoomState(room);
@@ -2018,6 +2041,9 @@ if (msg.type === "action_barricade_move") {
 
       // Stats: track rolls for registered players (no Gast)
       await recordRollStat(room, room.state.turnColor, v);
+
+      // Per-match titles: count rolled 1/6 etc. (server authoritative)
+      try{ recordMatchRoll(room, room.state.turnColor, v); }catch(_e){}
 
       room.state.rolled = v;
       room.lastRollWasSix = (v === 6);
@@ -2229,6 +2255,9 @@ if (msg.type === "move_request") {
       pc.nodeId = res.path[res.path.length - 1];
 
       const landed = pc.nodeId;
+
+      // Per-match titles: count walked fields (server authoritative)
+      try{ recordMatchMove(room, activeColor, Number(room.state.rolled||0) || 0); }catch(_e){}
 
       // kick opponent on landing
       const kicked = [];
