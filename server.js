@@ -1741,8 +1741,10 @@ broadcast(room, roomUpdatePayload(room));
         return;
       }
 
-      const starter = String(msg.starterColor || room._pendingStart?.starterColor || "").toLowerCase().trim();
-      initGameState(room, uniqueAct, msg.mode || "classic", starter);
+      // Server ist Chef: Startfarbe kommt aus start_request (pending) oder wird hier erneut zufällig bestimmt.
+      const starter = String(room._pendingStart?.starterColor || uniqueAct[Math.floor(Math.random() * uniqueAct.length)] || "").toLowerCase().trim();
+      const startMode = String(room._pendingStart?.mode || msg.mode || "classic");
+      initGameState(room, uniqueAct, startMode || "classic", starter);
       room._pendingStart = null;
       await persistRoomState(room);
       console.log(`[start] room=${room.code} starter=${room.state.turnColor}`);
