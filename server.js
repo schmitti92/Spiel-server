@@ -428,11 +428,209 @@ function recordMatchJoker(room, color, type){
      { id:"one",      title:"🧊 Pechvogel",           unit:"× 1 gewürfelt",       value:a4.value, winners:a4.winners },
      { id:"distance", title:"🥾 Wanderer",            unit:"Felder gelaufen",     value:a5.value, winners:a5.winners },
      { id:"jokers",   title:"🃏 Joker‑Meister",       unit:"Joker genutzt",       value:a8.value, winners:a8.winners },
-     { id:"slow",     title:"🐢 Vieldenker",          unit:"Ø Sekunden pro Zug",  value:a6.value!=null?Math.round(a6.value/100)/10:null, winners:a6.winners },
      { id:"fast",     title:"⚡ Blitzspieler",        unit:"Ø Sekunden pro Zug",  value:a7.value!=null?Math.round(a7.value/100)/10:null, winners:a7.winners },
    ];
  }
  // --------------------------------------------------------------------------
+
+// ---------------- Level / XP System (server authoritative) ----------------
+// Christoph rules (fixed):
+// - XP is awarded ONLY at match end (after titles/awards are computed).
+// - Participation: +30 XP
+// - Winner: +100 XP
+// - Joker used: +5 XP each
+// - Kick (enemy sent home): +5 XP each
+// - Each end-title earned: +10 XP
+// - Level curve: xpNeeded(level) = BASE + 50*(level-1)
+// - xpInLevel resets on level-up (carry remainder)
+const XP_RULES = {
+  participation: 30,
+  win: 100,
+  jokerUsed: 5,
+  kick: 5,
+  title: 10,
+  levelBase: 200,
+  levelStep: 50,
+};
+
+function xpNeededForLevel(level){
+  const L = Math.max(1, Math.floor(Number(level)||1));
+  return Math.max(1, Math.floor(XP_RULES.levelBase + XP_RULES.levelStep * (L-1)));
+}
+
+function computeTitlesWonByPlayer(room){
+  const awards = Array.isArray(room?.state?.matchAwards) ? room.state.matchAwards : [];
+  const map = {}; // name -> count
+  for(const a of awards){
+    const ws = Array.isArray(a?.winners) ? a.winners : [];
+    for(const n of ws){
+      const name = normName(n);
+      if(!name || isGuestName(name)) continue;
+      map[name] = (map[name]||0) + 1;
+    }
+  }
+  return map;
+}
+
+async function awardXpAndLevel(name, xpGain){
+  try{
+    initFirebaseIfConfigured();
+    if(!firestore) return { ok:false, reason:"NO_FIRESTORE" };
+    const displayName = normName(name);
+    if(isGuestName(displayName)) return { ok:false, reason:"GUEST" };
+    const ref = firestore.collection(STATS_COLLECTION).doc(statsDocId(displayName));
+    let result = null;
+    await firestore.runTransaction(async (tx)=>{
+      const snap = await tx.get(ref);
+      const cur = snap.exists ? (snap.data()||{}) : {};
+      const next = { ...cur };
+
+      next.name = displayName;
+
+      // Lazy-init for existing users (A): enable immediately without manual migration
+      let level = (typeof next.level === "number" && isFinite(next.level)) ? Math.max(1, Math.floor(next.level)) : 1;
+      let xpInLevel = (typeof next.xpInLevel === "number" && isFinite(next.xpInLevel)) ? Math.max(0, Math.floor(next.xpInLevel)) : 0;
+      let xpNeeded = (typeof next.xpNeeded === "number" && isFinite(next.xpNeeded)) ? Math.max(1, Math.floor(next.xpNeeded)) : xpNeededForLevel(level);
+      let xpLifetime = (typeof next.xpLifetime === "number" && isFinite(next.xpLifetime)) ? Math.max(0, Math.floor(next.xpLifetime)) : 0;
+
+      const gain = Math.max(0, Math.floor(Number(xpGain)||0));
+      xpLifetime += gain;
+      xpInLevel += gain;
+
+      // Level-up loop (carry remainder)
+      while(xpInLevel >= xpNeeded){
+        xpInLevel -= xpNeeded;
+        level += 1;
+        xpNeeded = xpNeededForLevel(level);
+      }
+
+      next.level = level;
+      next.xpInLevel = xpInLevel;
+      next.xpNeeded = xpNeeded;
+      next.xpLifetime = xpLifetime;
+      next.xpUpdatedAt = Date.now();
+      next.updatedAt = Date.now();
+
+      tx.set(ref, next, { merge:true });
+
+      result = {
+        ok:true,
+        name: displayName,
+        level,
+        xpInLevel,
+        xpNeeded,
+        xpLifetime,
+      };
+    });
+    return result || { ok:false, reason:"TX_EMPTY" };
+  }catch(e){
+    console.warn("[xp] award failed:", e?.message||e);
+    return { ok:false, reason:"ERROR" };
+  }
+}
+
+async function finalizeMatchXp(room, winnerColor){
+  try{
+    if(!room?.state) return null;
+    if(isTestRoom(room)) return null;
+    if(room.state.xpFinalized) return room.state.postMatchRewards || null;
+    room.state.xpFinalized = true;
+
+    // Ensure awards computed (titles) before XP
+    if(!Array.isArray(room.state.matchAwards)){
+      try{ room.state.matchAwards = computeMatchAwards(room); }catch(_e){ room.state.matchAwards = []; }
+    }
+
+    const titlesWon = computeTitlesWonByPlayer(room); // name -> count
+    const per = room?.state?.matchTrack?.perPlayer || {};
+    const active = Array.isArray(room.state.activeColors) && room.state.activeColors.length ? room.state.activeColors : ALLOWED_COLORS;
+    const wColor = String(winnerColor||room.state.winnerColor||"").toLowerCase();
+
+    const rewards = [];
+    for(const c of active){
+      const name = getPlayerNameByColor(room, c);
+      if(!name || isGuestName(name)) continue;
+      const st = per[name] || {};
+      const kicks = Number(st.kills||0)||0;
+      const jokersUsed = Number(st.jokersUsed||0)||0;
+      const tCount = Number(titlesWon[name]||0)||0;
+
+      let xpGain = 0;
+      xpGain += XP_RULES.participation;
+      if(String(c).toLowerCase() === wColor) xpGain += XP_RULES.win;
+      xpGain += XP_RULES.jokerUsed * Math.max(0, jokersUsed);
+      xpGain += XP_RULES.kick * Math.max(0, kicks);
+      xpGain += XP_RULES.title * Math.max(0, tCount);
+      xpGain = Math.max(0, Math.floor(xpGain));
+
+      const after = await awardXpAndLevel(name, xpGain);
+      if(!after || !after.ok){
+        rewards.push({ name, color:c, xpGain, persisted:false, titles:tCount, kicks, jokersUsed });
+        continue;
+      }
+
+      // Infer "before" for overlay by rewinding xpGain
+      let levelAfter = after.level;
+      let xpInLevelAfter = after.xpInLevel;
+      let xpNeededAfter = after.xpNeeded;
+
+      let levelBefore = levelAfter;
+      let xpNeededBefore = xpNeededAfter;
+      let xpInLevelBefore = xpInLevelAfter;
+      let rewind = Math.max(0, Math.floor(xpGain));
+      while(rewind > 0){
+        if(rewind <= xpInLevelBefore){
+          xpInLevelBefore -= rewind;
+          rewind = 0;
+          break;
+        }
+        rewind -= xpInLevelBefore;
+        if(levelBefore <= 1) { xpInLevelBefore = 0; rewind = 0; break; }
+        levelBefore -= 1;
+        xpNeededBefore = xpNeededForLevel(levelBefore);
+        xpInLevelBefore = xpNeededBefore;
+      }
+
+      rewards.push({
+        name: after.name,
+        color: c,
+        xpGain,
+        persisted: true,
+        titles: tCount,
+        kicks,
+        jokersUsed,
+        levelBefore,
+        levelAfter,
+        xpInLevelBefore,
+        xpInLevelAfter,
+        xpNeededAfter,
+        xpLifetime: after.xpLifetime,
+      });
+    }
+
+    const payload = {
+      type: "post_match_rewards",
+      matchId: room.state.matchId || null,
+      winnerColor: room.state.winnerColor || null,
+      rewards,
+      rules: {
+        participation: XP_RULES.participation,
+        win: XP_RULES.win,
+        jokerUsed: XP_RULES.jokerUsed,
+        kick: XP_RULES.kick,
+        title: XP_RULES.title,
+        levelBase: XP_RULES.levelBase,
+        levelStep: XP_RULES.levelStep,
+      }
+    };
+
+    room.state.postMatchRewards = payload;
+    return payload;
+  }catch(e){
+    console.warn("[xp] finalize failed:", e?.message||e);
+    return null;
+  }
+}
 
 async function finalizeMatchStats(room, winnerColor, opts={}){
    try{
@@ -2101,6 +2299,8 @@ if (msg.type === "action_barricade_move") {
       room.state.forfeiterColor = myColor;
 
       await finalizeMatchStats(room, room.state.winnerColor, { forfeiterColor: myColor });
+      // XP/Level: after titles are computed (server is chef)
+      try{ await finalizeMatchXp(room, room.state.winnerColor); }catch(_e){}
       await persistRoomState(room);
 
       broadcast(room, {
@@ -2109,6 +2309,11 @@ if (msg.type === "action_barricade_move") {
         winner: room.state.winnerColor,
         state: room.state,
       });
+
+      // Send post-match rewards AFTER the forfeit notice, so clients can show ceremony first.
+      if(room.state.postMatchRewards){
+        broadcast(room, room.state.postMatchRewards);
+      }
       return;
     }
 
@@ -2365,6 +2570,8 @@ if (msg.type === "move_request") {
         setGameOver(room, winner);
         console.log(`[win] room=${room.code} winner=${room.state.winnerColor}`);
         await finalizeMatchStats(room, room.state.winnerColor);
+        // XP/Level: award ONLY once, after titles exist
+        try{ await finalizeMatchXp(room, room.state.winnerColor); }catch(_e){}
       }
 
       console.log(`[move] room=${room.code} active=${activeColor} moved=${pc.color} piece=${pc.id} to=${pc.nodeId} picked=${picked}`);
@@ -2376,6 +2583,9 @@ if (msg.type === "move_request") {
       });
       if (room.state.finished) {
         broadcast(room, { type: "game_over", winnerColor: room.state.winnerColor, finishedAt: room.state.finishedAt, awards: room.state.matchAwards || [] });
+        if(room.state.postMatchRewards){
+          broadcast(room, room.state.postMatchRewards);
+        }
       }
       // Persist after every successful move so a server restart has the newest possible state.
       await persistRoomState(room);
