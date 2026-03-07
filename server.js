@@ -111,6 +111,16 @@ function addOwnedJoker(action, ownerColor, type, originColor, source="wheel"){
   const t = String(type || "");
   if(!ACTION_JOKER_TYPES.includes(t)) return;
   const origin = ALLOWED_COLORS.includes(originColor) ? originColor : ownerColor;
+
+  // Christoph-Wunsch: maximal 3 Joker pro Typ und Spieler.
+  // Wichtig: nur Begrenzung ergänzen, keine bestehende Vergabe-Logik entfernen.
+  const existing = countOwnedJokers(action, ownerColor, t);
+  if(existing >= 3){
+    console.log(`[joker-limit] ${ownerColor} hat bereits 3x ${t} -> neuer Joker verfällt`);
+    syncJokerCountsFromOwned(action);
+    return;
+  }
+
   action.jokersOwned[ownerColor].push({ type: t, color: origin, source, ts: Date.now() });
   syncJokerCountsFromOwned(action);
 }
